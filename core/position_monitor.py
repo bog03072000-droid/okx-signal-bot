@@ -37,7 +37,7 @@ from core.control_bot import notify_owner
 logger = logging.getLogger(__name__)
 
 CHECK_INTERVAL_SECONDS = 2
-# Додатковий запобіжник поверх батчингу — навіть при MAX_OPEN_POSITIONS=8 і
+# Додатковий запобіжник поверх батчингу — навіть при MAX_OPEN_POSITIONS=5 і
 # циклі раз/2с це зводить реальні HTTP-запити до DexScreener приблизно
 # до 1 на ~4с (~15/хв, свіжий запит раз на ~2 цикли), а не раз/цикл — з
 # великим запасом. Заодно узгоджено з тим, що сам DexScreener кешує на

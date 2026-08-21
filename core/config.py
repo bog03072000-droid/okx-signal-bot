@@ -58,8 +58,8 @@ class Settings:
     chain: str = os.getenv("CHAIN", "solana")
 
     # Ризик-менеджмент
-    max_position_pct: float = _float("MAX_POSITION_PCT", 2.0)
-    max_open_positions: int = _int("MAX_OPEN_POSITIONS", 8)
+    max_position_pct: float = _float("MAX_POSITION_PCT", 5.0)
+    max_open_positions: int = _int("MAX_OPEN_POSITIONS", 5)
     max_slippage_pct: float = _float("MAX_SLIPPAGE_PCT", 3.0)
     max_price_impact_pct: float = _float("MAX_PRICE_IMPACT_PCT", 5.0)
     daily_loss_limit_pct: float = _float("DAILY_LOSS_LIMIT_PCT", 10.0)
