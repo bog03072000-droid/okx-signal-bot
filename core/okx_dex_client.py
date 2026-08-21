@@ -24,8 +24,31 @@ logger = logging.getLogger(__name__)
 OKX_BASE_URL = "https://web3.okx.com"
 SOLANA_CHAIN_ID = "501"  # ідентифікатор Solana в OKX DEX API
 
-# Native SOL "адреса" за конвенцією OKX/Jupiter
+# Native SOL "адреса" за конвенцією OKX/Jupiter. З переходом на USDT як базову
+# торгову валюту (див. USDT_MINT_SOLANA нижче) ця адреса вже НЕ використовується
+# для buy/sell у main.py — лишається потрібною лише для запиту балансу SOL
+# (резерв на газ, core/wallet.py).
 SOL_NATIVE_ADDRESS = "11111111111111111111111111111111"
+
+# USDT (Tether) на Solana — SPL-токен, mint-адреса. Базова торгова валюта бота.
+#
+# ДЖЕРЕЛО (навмисно НЕ з пам'яті — перевірено двома незалежними способами
+# перед тим, як цю адресу вписали в код):
+#   1. Пряме читання on-chain даних з mainnet-beta через RPC getAccountInfo:
+#      owner = TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA (стандартна SPL
+#      Token Program, підтверджує що це справжній SPL-токен, а не підробка),
+#      decimals = 6 (співпадає з офіційним USDT).
+#   2. Незалежне підтвердження на публічних explorer/wallet-сервісах, усі
+#      показують ту саму адресу для "USDT" на Solana:
+#      https://explorer.solana.com/address/Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB
+#      https://solscan.io/token/Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB
+#      https://phantom.com/tokens/solana/Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB
+#
+# ПЕРЕД LIVE-ЗАПУСКОМ (DRY_RUN=false): звір цю адресу ще раз сам, окремо від
+# цього коментаря — помилка в mint-адресі тут означає, що бот купує/рахує
+# баланс не того токена (може навіть підставного токена з такою ж назвою).
+USDT_MINT_SOLANA = "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB"
+USDT_DECIMALS = 6
 
 
 @dataclass

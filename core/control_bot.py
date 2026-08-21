@@ -64,6 +64,16 @@ async def cmd_status(message: Message):
         rejected_today = session.query(SignalLog).filter(
             SignalLog.created_at >= start, SignalLog.rejection_reason.isnot(None)
         ).count()
+        # Рахуємо по структурованій колонці chain, а не по тексту rejection_reason
+        # (крихкіше було б звірятись з конкретним форматуванням фрази в main.py) —
+        # is_signal=True І chain задано, але не "solana" = LLM визнав сигнал, але
+        # мережа поки не підтримується виконанням (тільки Solana).
+        unsupported_chain_today = session.query(SignalLog).filter(
+            SignalLog.created_at >= start,
+            SignalLog.is_signal.is_(True),
+            SignalLog.chain.isnot(None),
+            SignalLog.chain != "solana",
+        ).count()
 
         mode = "🧪 DRY RUN (без реальних угод)" if settings.dry_run else "🔴 LIVE (реальні гроші)"
         pause_state = "⏸️ НА ПАУЗІ (/start щоб відновити)" if runtime_state.is_paused() else "▶️ активна"
@@ -74,7 +84,8 @@ async def cmd_status(message: Message):
             f"Торгівля: {pause_state}\n"
             f"Сигналів сьогодні: {signals_today}\n"
             f"Виконано угод: {executed_today}\n"
-            f"Відхилено: {rejected_today}",
+            f"Відхилено: {rejected_today}\n"
+            f"Відхилено через непідтримувану мережу: {unsupported_chain_today}",
             parse_mode="HTML",
         )
     finally:
@@ -90,12 +101,14 @@ async def cmd_balance(message: Message):
         session.close()
 
     balance = get_wallet_balance()
+    usdt_line = f"${balance.usdt_balance:,.2f}" if balance.usdt_balance is not None else "н/д"
     sol_line = f"{balance.sol_balance:.4f} SOL" if balance.sol_balance is not None else "н/д"
+    gas_marker = " ⚠️ МАЛО НА ГАЗ" if balance.low_gas_warning else ""
 
     await message.answer(
         "💰 <b>Баланс гаманця</b>\n"
-        f"SOL: {sol_line}\n"
-        f"≈ ${balance.usd_estimate:,.2f}\n"
+        f"USDT (торговий капітал): {usdt_line}\n"
+        f"SOL (резерв на газ): {sol_line}{gas_marker}\n"
         f"У відкритих позиціях: ≈ ${open_positions_usd:,.2f}\n"
         f"{'⚠️ ' + balance.note if balance.note else ''}",
         parse_mode="HTML",
@@ -257,7 +270,28 @@ async def cmd_help(message: Message):
     )
 
 
+_bot: "Bot | None" = None
+
+
+async def notify_owner(text: str):
+    """
+    Сповіщення власнику ЧЕРЕЗ CONTROL-БОТА (не через Telethon-listener і не
+    через TG_NOTIFY_CHAT_ID) — окремий канал для подій, що стаються поза
+    командним потоком, напр. автоматичне спрацювання ladder TP/SL з
+    core/position_monitor.py. Свідомо відокремлено від сповіщень про сигнали
+    з каналу (main.py notify()), щоб було видно, звідки прийшла подія.
+    """
+    if _bot is None or not settings.tg_owner_user_id:
+        logger.info(f"NOTIFY (control-бот не запущено): {text}")
+        return
+    try:
+        await _bot.send_message(settings.tg_owner_user_id, text, parse_mode="HTML")
+    except Exception as e:
+        logger.warning(f"Не вдалось надіслати сповіщення власнику через control-бота: {e}")
+
+
 async def run_control_bot():
+    global _bot
     if not settings.tg_bot_token or not settings.tg_owner_user_id:
         logger.warning(
             "TG_BOT_TOKEN / TG_OWNER_USER_ID не задані — control-бот НЕ запущено. "
@@ -265,8 +299,8 @@ async def run_control_bot():
         )
         return
 
-    bot = Bot(token=settings.tg_bot_token)
+    _bot = Bot(token=settings.tg_bot_token)
     dp = Dispatcher()
     dp.include_router(router)
     logger.info("Control-бот запущено (aiogram, Bot API), доступ обмежено TG_OWNER_USER_ID")
-    await dp.start_polling(bot)
+    await dp.start_polling(_bot)

@@ -15,10 +15,12 @@ from core.config import settings, validate_settings
 from core.signal_parser import SignalParser
 from core.token_screener import TokenScreener
 from core.risk_manager import RiskManager
-from core.okx_dex_client import OKXDexClient, SOL_NATIVE_ADDRESS
+from core.okx_dex_client import OKXDexClient, USDT_MINT_SOLANA, USDT_DECIMALS
 from core.storage import init_db, get_session, SignalLog, Trade
-from core.wallet import MOCK_WALLET_BALANCE_USD
+from core.wallet import get_wallet_balance, MOCK_WALLET_BALANCE_USD
 from core.control_bot import run_control_bot
+from core.price_feed import fetch_price_usd
+from core.position_monitor import position_monitor_loop, execute_partial_sell, remaining_amount, POSITION_EPSILON
 
 logging.basicConfig(
     level=logging.INFO,
@@ -33,6 +35,12 @@ dex = OKXDexClient()
 
 HEARTBEAT_FILE = "data/heartbeat.txt"
 HEARTBEAT_INTERVAL_SECONDS = 30
+
+# Слова, що можуть означати продаж у reply-повідомленні без адреси контракту
+# (канал згадує продажі саме так — див. core/signal_parser.py REPLY_SELL_SYSTEM_PROMPT).
+# Це лише швидкий Python-фільтр ДО виклику LLM (щоб не палити токени Claude
+# на кожен reply без ознак продажу) — остаточне рішення все одно приймає LLM.
+SELL_REPLY_KEYWORDS = ["слил", "закрыл", "вышел", "зафиксил", "флипнул", "продал", "скинул"]
 
 
 async def notify(client: TelegramClient, text: str):
@@ -78,7 +86,22 @@ async def process_signal(client: TelegramClient, message_text: str):
             log_entry.rejection_reason = "Не є торговим сигналом"
             session.add(log_entry)
             session.commit()
-            return
+            return parsed
+
+        # --- Підтримка мережі (поки лише Solana) ---
+        # Тихий запис в лог для статистики (/status показує лічильник) — БЕЗ
+        # сповіщення власнику: канал регулярно кидає EVM-адреси поряд з
+        # Solana, і сповіщення про кожну засмічувало б чат. EVM-підтримка
+        # запланована на майбутнє, зараз бот свідомо не намагається торгувати
+        # тим, що не вміє виконати.
+        if parsed.chain and parsed.chain != "solana":
+            log_entry.rejection_reason = (
+                f"Мережа {parsed.chain} поки не підтримується ботом (тільки Solana). "
+                "EVM-підтримка запланована на майбутнє."
+            )
+            session.add(log_entry)
+            session.commit()
+            return parsed
 
         logger.info(
             f"Сигнал розпізнано: {parsed.action} {parsed.token_symbol} "
@@ -93,7 +116,7 @@ async def process_signal(client: TelegramClient, message_text: str):
             log_entry.rejection_reason = paused_check.reason
             session.add(log_entry)
             session.commit()
-            return
+            return parsed
 
         # --- Ризик-перевірка: впевненість ---
         conf_check = risk.check_confidence(parsed.confidence)
@@ -102,7 +125,7 @@ async def process_signal(client: TelegramClient, message_text: str):
             session.add(log_entry)
             session.commit()
             await notify(client, f"⚠️ Сигнал відхилено: {conf_check.reason}\nТекст: {message_text[:200]}")
-            return
+            return parsed
 
         # --- Резолвинг адреси контракту ---
         contract = resolve_contract_address(parsed)
@@ -112,7 +135,7 @@ async def process_signal(client: TelegramClient, message_text: str):
             session.add(log_entry)
             session.commit()
             await notify(client, f"⚠️ Сигнал відхилено: {reason}")
-            return
+            return parsed
 
         # --- Cooldown ---
         cooldown_check = risk.check_cooldown(parsed.chain or settings.chain)
@@ -120,7 +143,7 @@ async def process_signal(client: TelegramClient, message_text: str):
             log_entry.rejection_reason = cooldown_check.reason
             session.add(log_entry)
             session.commit()
-            return
+            return parsed
 
         # --- Ліміт відкритих позицій (тільки для buy) ---
         if parsed.action == "buy":
@@ -130,16 +153,38 @@ async def process_signal(client: TelegramClient, message_text: str):
                 session.add(log_entry)
                 session.commit()
                 await notify(client, f"⚠️ Сигнал відхилено: {pos_check.reason}")
-                return
+                return parsed
+
+        # --- Баланс гаманця (USDT — торговий капітал, SOL — резерв на газ) ---
+        wallet_balance = get_wallet_balance()
+
+        if not settings.dry_run and wallet_balance.usdt_balance is None:
+            # У LIVE-режимі свідомо НЕ підставляємо MOCK_WALLET_BALANCE_USD, якщо
+            # реальний баланс USDT не вдалось отримати (RPC впав/rate limit) —
+            # краще відхилити сигнал, ніж порахувати розмір реальної позиції
+            # наосліп по вигаданому числу.
+            reason = "Не вдалось отримати реальний баланс USDT з RPC — угоду відхилено (безпечніше не торгувати, ніж рахувати позицію наосліп)"
+            log_entry.rejection_reason = reason
+            session.add(log_entry)
+            session.commit()
+            await notify(client, f"🛑 {reason}")
+            return parsed
+
+        if wallet_balance.low_gas_warning:
+            await notify(client, f"⛽ {wallet_balance.note}")
+
+        effective_balance_usd = (
+            wallet_balance.usdt_balance if wallet_balance.usdt_balance is not None else MOCK_WALLET_BALANCE_USD
+        )
 
         # --- Денний ліміт збитків ---
-        loss_check = risk.check_daily_loss_limit(MOCK_WALLET_BALANCE_USD)
+        loss_check = risk.check_daily_loss_limit(effective_balance_usd)
         if not loss_check.allowed:
             log_entry.rejection_reason = loss_check.reason
             session.add(log_entry)
             session.commit()
             await notify(client, f"🛑 БОТ ЗУПИНЕНО: {loss_check.reason}")
-            return
+            return parsed
 
         # --- Токен-скринінг (тільки для buy — продавати наявне можна завжди) ---
         if parsed.action == "buy":
@@ -150,16 +195,26 @@ async def process_signal(client: TelegramClient, message_text: str):
                 session.add(log_entry)
                 session.commit()
                 await notify(client, f"⚠️ Сигнал відхилено: {reason}")
-                return
+                return parsed
 
         # --- Розрахунок розміру позиції ---
-        position_size_usd = risk.calculate_position_size(MOCK_WALLET_BALANCE_USD)
+        position_size_usd = risk.calculate_position_size(effective_balance_usd)
 
         # --- Quote ---
-        from_addr = SOL_NATIVE_ADDRESS if parsed.action == "buy" else contract
-        to_addr = contract if parsed.action == "buy" else SOL_NATIVE_ADDRESS
-        # amount_raw має бути в найменших одиницях (lamports для SOL) — спрощено для прикладу
-        amount_raw = str(int(position_size_usd * 1_000_000_000 / 150))  # припущення: SOL ~$150
+        # USDT — базова торгова валюта (замість native SOL, який лишається лише
+        # на газ — див. core/wallet.py). USDT — стейблкоїн, курс до USD ~1:1 за
+        # визначенням, тому USD-сума ≈ USDT-сума напряму, без курсу конвертації.
+        #
+        # СКЕПТИЧНИЙ КОМЕНТАР: "~1:1" — це припущення, не гарантія. USDT теоретично
+        # може де-пегнутись (тимчасово чи стійко відхилитись від $1 — таке бувало
+        # з іншими стейблкоїнами при стресі на ринку). Для точного розрахунку
+        # реальної вартості свопу варто орієнтуватись на fromTokenAmount/
+        # toTokenAmount із самого quote (нижче), а не на цю грубу оцінку "1 USDT = $1" —
+        # тут це прийнятно лише для розрахунку amount_raw ПЕРЕД запитом quote.
+        from_addr = USDT_MINT_SOLANA if parsed.action == "buy" else contract
+        to_addr = contract if parsed.action == "buy" else USDT_MINT_SOLANA
+        # amount_raw — у найменших одиницях USDT (6 decimals, на відміну від 9 у SOL/lamports)
+        amount_raw = str(int(position_size_usd * (10 ** USDT_DECIMALS)))
 
         quote = dex.get_quote(from_addr, to_addr, amount_raw)
         if not quote.success:
@@ -167,7 +222,7 @@ async def process_signal(client: TelegramClient, message_text: str):
             session.add(log_entry)
             session.commit()
             await notify(client, f"❌ Помилка quote: {quote.error}")
-            return
+            return parsed
 
         impact_check = risk.check_price_impact(quote.price_impact_pct or 0)
         if not impact_check.allowed:
@@ -175,7 +230,7 @@ async def process_signal(client: TelegramClient, message_text: str):
             session.add(log_entry)
             session.commit()
             await notify(client, f"⚠️ Сигнал відхилено: {impact_check.reason}")
-            return
+            return parsed
 
         # --- Виконання (або dry-run симуляція) ---
         swap_result = dex.execute_swap(
@@ -195,6 +250,31 @@ async def process_signal(client: TelegramClient, message_text: str):
             dry_run=swap_result.dry_run,
             status="confirmed" if swap_result.success else "failed",
         )
+
+        if parsed.action == "buy" and swap_result.success:
+            # token_amount — RAW (найменші одиниці) отриманого токена, напряму
+            # з quote.to_amount (а не через ручний перерахунок decimals) — це
+            # саме ті одиниці, які знадобляться напряму для amount_raw
+            # майбутніх часткових sell у core/position_monitor.py (ladder TP/SL).
+            try:
+                trade.token_amount = float(quote.to_amount) if quote.to_amount else None
+            except (TypeError, ValueError):
+                trade.token_amount = None
+
+            # entry_price — ринкова ціна ОДРАЗУ після виконання (з DexScreener,
+            # а не з quote — quote дає курс СВОПУ, а не ту саму ціну, яку буде
+            # звіряти монітор позицій; звіряємо яблука з яблуками).
+            # Якщо lookup не вдався — trade.entry_price лишається None, і
+            # core/position_monitor.py._get_open_positions() свідомо пропускає
+            # такі позиції — жодного автоматичного SL/TP на них не буде,
+            # лишається тільки ручний /positions.
+            trade.entry_price = fetch_price_usd(contract, parsed.chain or settings.chain)
+            if trade.entry_price is None:
+                logger.warning(
+                    f"Не вдалось отримати entry_price для {parsed.token_symbol} — "
+                    "ladder TP/SL моніторинг НЕ підхопить цю позицію."
+                )
+
         session.add(trade)
 
         log_entry.executed = swap_result.success
@@ -210,6 +290,78 @@ async def process_signal(client: TelegramClient, message_text: str):
             f"на ${position_size_usd:.2f} | tx: {swap_result.tx_hash}",
         )
 
+        return parsed
+
+    finally:
+        session.close()
+
+
+async def process_reply_sell(client: TelegramClient, event):
+    """
+    Best-effort обробка sell-згадок у reply без адреси контракту (напр.
+    "слил половину" у відповідь на оригінальний кол). Викликається з
+    handler() ТІЛЬКИ коли: це reply, звичайний parse() оригінального
+    reply-тексту вже сказав is_signal=false, і текст містить одне з
+    SELL_REPLY_KEYWORDS — це додатковий сигнал на закриття В ПАРІ З ladder
+    TP/SL (core/position_monitor.py), а НЕ заміна йому: якщо ladder вже
+    закрив позицію повністю, цей heuristic просто ігнорує "нема чого продавати".
+    """
+    reply_text = event.message.message
+    if not reply_text:
+        return
+
+    try:
+        original_msg = await client.get_messages(event.chat_id, ids=event.message.reply_to_msg_id)
+    except Exception as e:
+        logger.warning(f"Reply-sell: не вдалось отримати оригінальне повідомлення: {e}")
+        return
+    if not original_msg or not original_msg.message:
+        return
+
+    original_parsed = parser.parse(original_msg.message)
+    if not original_parsed.contract_address:
+        logger.info("Reply-sell: оригінал не містить адреси контракту — пропускаємо")
+        return
+
+    reply_result = parser.parse_reply_sell(reply_text, original_msg.message)
+    if not reply_result["is_sell_signal"] or reply_result["confidence"] < settings.min_signal_confidence:
+        logger.info(
+            f"Reply-sell: LLM не підтвердив sell для {original_parsed.token_symbol} "
+            f"(confidence={reply_result['confidence']:.2f}): {reply_result['reasoning']}"
+        )
+        return
+
+    fraction = reply_result.get("sell_fraction")
+    if fraction is None:
+        fraction = 0.5  # евристичний дефолт, коли з тексту неясно яка саме частка
+    fraction = max(0.0, min(1.0, float(fraction)))
+
+    session = get_session()
+    try:
+        buy = session.query(Trade).filter(
+            Trade.action == "buy",
+            Trade.status == "confirmed",
+            Trade.contract_address == original_parsed.contract_address,
+        ).order_by(Trade.created_at.desc()).first()
+
+        if not buy or remaining_amount(session, buy) <= POSITION_EPSILON:
+            logger.info(
+                f"Reply-sell: позиція {original_parsed.token_symbol} ({original_parsed.contract_address}) "
+                "вже закрита або не знайдена в БД — ігноруємо (ймовірно, ladder TP/SL вже закрив її)."
+            )
+            return
+
+        remaining = remaining_amount(session, buy)
+        sell_amount = remaining * fraction
+        current_price = fetch_price_usd(original_parsed.contract_address, original_parsed.chain or settings.chain)
+        close_reason = f"reply_sell_heuristic_{int(round(fraction * 100))}pct"
+
+        logger.info(
+            f"Reply-sell: продаємо {fraction:.0%} залишку {original_parsed.token_symbol} "
+            f"(евристика з тексту reply, LLM confidence={reply_result['confidence']:.2f}): "
+            f"{reply_result['reasoning']}"
+        )
+        await execute_partial_sell(session, buy, close_reason, sell_amount, current_price)
     finally:
         session.close()
 
@@ -252,18 +404,31 @@ async def main():
         if not text:
             return
         logger.info(f"Нове повідомлення: {text[:100]}...")
-        await process_signal(client, text)
+        parsed = await process_signal(client, text)
+
+        # Reply-sell евристика: тільки якщо це reply, звичайний парсинг сказав
+        # "не сигнал" (типово — бо нема адреси контракту в самому reply), і
+        # текст схожий на sell-згадку. Швидкий keyword-фільтр ДО виклику LLM,
+        # щоб не витрачати запити Claude на кожен reply без жодних ознак продажу.
+        if (
+            event.message.reply_to_msg_id
+            and parsed is not None
+            and not parsed.is_signal
+            and any(kw in text.lower() for kw in SELL_REPLY_KEYWORDS)
+        ):
+            await process_reply_sell(client, event)
 
     await client.start()
     logger.info(f"Слухаю канал: {settings.tg_channel_username}")
 
-    # Listener-клієнт (Telethon, user-акаунт), control-бот (aiogram, Bot API)
-    # і heartbeat крутяться в одному asyncio event loop — окремий процес для
-    # control-бота ускладнив би деплой (два systemd unit / два контейнери)
-    # без реальної потреби на цьому масштабі.
+    # Listener-клієнт (Telethon, user-акаунт), control-бот (aiogram, Bot API),
+    # ladder TP/SL монітор позицій і heartbeat крутяться в одному asyncio
+    # event loop — окремий процес для кожного ускладнив би деплой (кілька
+    # systemd unit / кілька контейнерів) без реальної потреби на цьому масштабі.
     await asyncio.gather(
         client.run_until_disconnected(),
         run_control_bot(),
+        position_monitor_loop(),
         heartbeat_loop(),
     )
 
