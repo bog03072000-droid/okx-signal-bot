@@ -197,115 +197,159 @@ async def process_signal(client: TelegramClient, message_text: str):
                 await notify(client, f"⚠️ Сигнал відхилено: {reason}")
                 return parsed
 
-        # --- Розрахунок розміру позиції ---
-        position_size_usd = risk.calculate_position_size(effective_balance_usd)
+        if parsed.action == "buy":
+            # --- Розрахунок розміру позиції ---
+            position_size_usd = risk.calculate_position_size(effective_balance_usd)
 
-        # --- Quote ---
-        # USDT — базова торгова валюта (замість native SOL, який лишається лише
-        # на газ — див. core/wallet.py). USDT — стейблкоїн, курс до USD ~1:1 за
-        # визначенням, тому USD-сума ≈ USDT-сума напряму, без курсу конвертації.
-        #
-        # СКЕПТИЧНИЙ КОМЕНТАР: "~1:1" — це припущення, не гарантія. USDT теоретично
-        # може де-пегнутись (тимчасово чи стійко відхилитись від $1 — таке бувало
-        # з іншими стейблкоїнами при стресі на ринку). Для точного розрахунку
-        # реальної вартості свопу варто орієнтуватись на fromTokenAmount/
-        # toTokenAmount із самого quote (нижче), а не на цю грубу оцінку "1 USDT = $1" —
-        # тут це прийнятно лише для розрахунку amount_raw ПЕРЕД запитом quote.
-        from_addr = USDT_MINT_SOLANA if parsed.action == "buy" else contract
-        to_addr = contract if parsed.action == "buy" else USDT_MINT_SOLANA
-        # amount_raw — у найменших одиницях USDT (6 decimals, на відміну від 9 у SOL/lamports)
-        amount_raw = str(int(position_size_usd * (10 ** USDT_DECIMALS)))
+            # --- Quote ---
+            # USDT — базова торгова валюта (замість native SOL, який лишається лише
+            # на газ — див. core/wallet.py). USDT — стейблкоїн, курс до USD ~1:1 за
+            # визначенням, тому USD-сума ≈ USDT-сума напряму, без курсу конвертації.
+            #
+            # СКЕПТИЧНИЙ КОМЕНТАР: "~1:1" — це припущення, не гарантія. USDT теоретично
+            # може де-пегнутись (тимчасово чи стійко відхилитись від $1 — таке бувало
+            # з іншими стейблкоїнами при стресі на ринку). Для точного розрахунку
+            # реальної вартості свопу варто орієнтуватись на fromTokenAmount/
+            # toTokenAmount із самого quote (нижче), а не на цю грубу оцінку "1 USDT = $1" —
+            # тут це прийнятно лише для розрахунку amount_raw ПЕРЕД запитом quote.
+            from_addr = USDT_MINT_SOLANA
+            to_addr = contract
+            # amount_raw — у найменших одиницях USDT (6 decimals, на відміну від 9 у SOL/lamports)
+            amount_raw = str(int(position_size_usd * (10 ** USDT_DECIMALS)))
 
-        if int(amount_raw) <= 0:
-            # Найчастіша причина — гаманець ще не поповнений USDT (баланс 0,
-            # тож і calculate_position_size() дає 0). Без цієї перевірки бот
-            # робив би реальний запит quote до OKX з amount=0 щоразу на кожен
-            # сигнал — зайве навантаження на API і незрозуміла помилка від
-            # OKX замість чіткої причини тут.
-            reason = (
-                "Розрахований розмір угоди — 0 USDT (ймовірно, баланс USDT порожній). "
-                "Сигнал відхилено без запиту quote."
-            )
-            log_entry.rejection_reason = reason
-            session.add(log_entry)
-            session.commit()
-            return parsed
-
-        quote = dex.get_quote(from_addr, to_addr, amount_raw)
-        if not quote.success:
-            log_entry.rejection_reason = f"Помилка отримання quote: {quote.error}"
-            session.add(log_entry)
-            session.commit()
-            await notify(client, f"❌ Помилка quote: {quote.error}")
-            return parsed
-
-        impact_check = risk.check_price_impact(quote.price_impact_pct or 0)
-        if not impact_check.allowed:
-            log_entry.rejection_reason = impact_check.reason
-            session.add(log_entry)
-            session.commit()
-            await notify(client, f"⚠️ Сигнал відхилено: {impact_check.reason}")
-            return parsed
-
-        # --- Виконання (або dry-run симуляція) ---
-        swap_result = dex.execute_swap(
-            from_addr, to_addr, amount_raw,
-            wallet_address="<буде підставлено з гаманця>",
-            slippage_pct=settings.max_slippage_pct,
-            chain_id="501",
-        )
-
-        trade = Trade(
-            action=parsed.action,
-            token_symbol=parsed.token_symbol,
-            contract_address=contract,
-            chain=parsed.chain or settings.chain,
-            amount_usd=position_size_usd,
-            tx_hash=swap_result.tx_hash,
-            dry_run=swap_result.dry_run,
-            status="confirmed" if swap_result.success else "failed",
-        )
-
-        if parsed.action == "buy" and swap_result.success:
-            # token_amount — RAW (найменші одиниці) отриманого токена, напряму
-            # з quote.to_amount (а не через ручний перерахунок decimals) — це
-            # саме ті одиниці, які знадобляться напряму для amount_raw
-            # майбутніх часткових sell у core/position_monitor.py (ladder TP/SL).
-            try:
-                trade.token_amount = float(quote.to_amount) if quote.to_amount else None
-            except (TypeError, ValueError):
-                trade.token_amount = None
-
-            # entry_price — ринкова ціна ОДРАЗУ після виконання (з DexScreener,
-            # а не з quote — quote дає курс СВОПУ, а не ту саму ціну, яку буде
-            # звіряти монітор позицій; звіряємо яблука з яблуками).
-            # Якщо lookup не вдався — trade.entry_price лишається None, і
-            # core/position_monitor.py._get_open_positions() свідомо пропускає
-            # такі позиції — жодного автоматичного SL/TP на них не буде,
-            # лишається тільки ручний /positions.
-            trade.entry_price = fetch_price_usd(contract, parsed.chain or settings.chain)
-            if trade.entry_price is None:
-                logger.warning(
-                    f"Не вдалось отримати entry_price для {parsed.token_symbol} — "
-                    "ladder TP/SL моніторинг НЕ підхопить цю позицію."
+            if int(amount_raw) <= 0:
+                # Найчастіша причина — гаманець ще не поповнений USDT (баланс 0,
+                # тож і calculate_position_size() дає 0). Без цієї перевірки бот
+                # робив би реальний запит quote до OKX з amount=0 щоразу на кожен
+                # сигнал — зайве навантаження на API і незрозуміла помилка від
+                # OKX замість чіткої причини тут.
+                reason = (
+                    "Розрахований розмір угоди — 0 USDT (ймовірно, баланс USDT порожній). "
+                    "Сигнал відхилено без запиту quote."
                 )
+                log_entry.rejection_reason = reason
+                session.add(log_entry)
+                session.commit()
+                return parsed
 
-        session.add(trade)
+            quote = dex.get_quote(from_addr, to_addr, amount_raw)
+            if not quote.success:
+                log_entry.rejection_reason = f"Помилка отримання quote: {quote.error}"
+                session.add(log_entry)
+                session.commit()
+                await notify(client, f"❌ Помилка quote: {quote.error}")
+                return parsed
 
-        log_entry.executed = swap_result.success
-        session.add(log_entry)
-        session.commit()
+            impact_check = risk.check_price_impact(quote.price_impact_pct or 0)
+            if not impact_check.allowed:
+                log_entry.rejection_reason = impact_check.reason
+                session.add(log_entry)
+                session.commit()
+                await notify(client, f"⚠️ Сигнал відхилено: {impact_check.reason}")
+                return parsed
 
-        risk.register_trade_time(parsed.chain or settings.chain)
+            # --- Виконання (або dry-run симуляція) ---
+            swap_result = dex.execute_swap(
+                from_addr, to_addr, amount_raw,
+                wallet_address="<буде підставлено з гаманця>",
+                slippage_pct=settings.max_slippage_pct,
+                chain_id="501",
+            )
 
-        prefix = "🧪 [DRY RUN] " if swap_result.dry_run else "✅ "
-        await notify(
-            client,
-            f"{prefix}{parsed.action.upper()} {parsed.token_symbol} "
-            f"на ${position_size_usd:.2f} | tx: {swap_result.tx_hash}",
-        )
+            trade = Trade(
+                action="buy",
+                token_symbol=parsed.token_symbol,
+                contract_address=contract,
+                chain=parsed.chain or settings.chain,
+                amount_usd=position_size_usd,
+                tx_hash=swap_result.tx_hash,
+                dry_run=swap_result.dry_run,
+                status="confirmed" if swap_result.success else "failed",
+            )
 
-        return parsed
+            if swap_result.success:
+                # token_amount — RAW (найменші одиниці) отриманого токена, напряму
+                # з quote.to_amount (а не через ручний перерахунок decimals) — це
+                # саме ті одиниці, які знадобляться напряму для amount_raw
+                # майбутніх часткових sell у core/position_monitor.py (ladder TP/SL).
+                try:
+                    trade.token_amount = float(quote.to_amount) if quote.to_amount else None
+                except (TypeError, ValueError):
+                    trade.token_amount = None
+
+                # entry_price — ринкова ціна ОДРАЗУ після виконання (з DexScreener,
+                # а не з quote — quote дає курс СВОПУ, а не ту саму ціну, яку буде
+                # звіряти монітор позицій; звіряємо яблука з яблуками).
+                # Якщо lookup не вдався — trade.entry_price лишається None, і
+                # core/position_monitor.py._get_open_positions() свідомо пропускає
+                # такі позиції — жодного автоматичного SL/TP на них не буде,
+                # лишається тільки ручний /positions.
+                trade.entry_price = fetch_price_usd(contract, parsed.chain or settings.chain)
+                if trade.entry_price is None:
+                    logger.warning(
+                        f"Не вдалось отримати entry_price для {parsed.token_symbol} — "
+                        "ladder TP/SL моніторинг НЕ підхопить цю позицію."
+                    )
+
+            session.add(trade)
+
+            log_entry.executed = swap_result.success
+            session.add(log_entry)
+            session.commit()
+
+            risk.register_trade_time(parsed.chain or settings.chain)
+
+            prefix = "🧪 [DRY RUN] " if swap_result.dry_run else "✅ "
+            await notify(
+                client,
+                f"{prefix}BUY {parsed.token_symbol} на ${position_size_usd:.2f} | tx: {swap_result.tx_hash}",
+            )
+
+            return parsed
+
+        else:
+            # --- SELL по прямому сигналу з каналу (контракт вказано явно в тексті) ---
+            # На відміну від reply-sell (process_reply_sell нижче) і ladder TP/SL
+            # (core/position_monitor.py), тут контракт відомий одразу з самого
+            # сигналу — окремого LLM-виклику для пошуку контракту не треба.
+            #
+            # Продає 100% залишку ВІДСТЕЖЕНОЇ buy-позиції (через parent_trade_id,
+            # execute_partial_sell) — НЕ довільний % від балансу USDT, як було
+            # раніше: сигнал "продай X" стосується ТОКЕНА, яким бот реально
+            # володіє, а не суми в USDT (амаунт у USDT для продажу ТОКЕНА не мав
+            # сенсу — це й був корінь того, що PnL взагалі не можна було порахувати
+            # для цього шляху, бо не було зв'язку з конкретною buy-позицією).
+            # Якщо колись amount_hint навчаться парсити як частку ("продай
+            # половину") — сюди можна підставити fraction < 1.0, наразі завжди
+            # повний вихід із позиції.
+            buy = session.query(Trade).filter(
+                Trade.action == "buy",
+                Trade.status == "confirmed",
+                Trade.contract_address == contract,
+            ).order_by(Trade.created_at.desc()).first()
+
+            if not buy or remaining_amount(session, buy) <= POSITION_EPSILON:
+                reason = "Sell-сигнал по контракту без відстежуваної відкритої позиції в БД — нічого продавати"
+                log_entry.rejection_reason = reason
+                session.add(log_entry)
+                session.commit()
+                return parsed
+
+            sell_amount = remaining_amount(session, buy)
+            current_price = fetch_price_usd(contract, parsed.chain or settings.chain)
+
+            # execute_partial_sell сама пише Trade (з pnl_usd) і сповіщає власника
+            # через control-бота — окремий notify() тут не потрібен.
+            success = await execute_partial_sell(session, buy, "signal_sell", sell_amount, current_price)
+
+            log_entry.executed = success
+            session.add(log_entry)
+            session.commit()
+
+            if success:
+                risk.register_trade_time(parsed.chain or settings.chain)
+
+            return parsed
 
     finally:
         session.close()

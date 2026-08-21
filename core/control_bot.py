@@ -101,6 +101,7 @@ USER_KEYBOARD = ReplyKeyboardMarkup(
     keyboard=[
         [KeyboardButton(text="📊 Статус"), KeyboardButton(text="💰 Баланс")],
         [KeyboardButton(text="📈 Позиції"), KeyboardButton(text="📜 Історія")],
+        [KeyboardButton(text="📊 Статистика")],
     ],
     resize_keyboard=True,
     is_persistent=True,
@@ -110,6 +111,7 @@ ADMIN_KEYBOARD = ReplyKeyboardMarkup(
     keyboard=[
         [KeyboardButton(text="📊 Статус"), KeyboardButton(text="💰 Баланс")],
         [KeyboardButton(text="📈 Позиції"), KeyboardButton(text="📜 Історія")],
+        [KeyboardButton(text="📊 Статистика")],
         [KeyboardButton(text="⏸ Стоп"), KeyboardButton(text="▶️ Старт")],
         [KeyboardButton(text="⚙️ Ліміти"), KeyboardButton(text="👥 Користувачі")],
         [KeyboardButton(text="🧪 Тест")],
@@ -615,6 +617,43 @@ async def cmd_test(message: Message):
     await message.answer("\n".join(ladder_report), parse_mode="HTML")
 
 
+def _stats_period_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="День", callback_data="stats:day"),
+        InlineKeyboardButton(text="Тиждень", callback_data="stats:week"),
+        InlineKeyboardButton(text="Місяць", callback_data="stats:month"),
+    ]])
+
+
+@router.message(Command("stats"), is_allowed)
+@router.message(F.text == "📊 Статистика", is_allowed)
+async def cmd_stats(message: Message):
+    await message.answer("📊 За який період?", reply_markup=_stats_period_keyboard())
+
+
+@router.callback_query(F.data.startswith("stats:"), is_allowed)
+async def cb_stats(callback: CallbackQuery):
+    """
+    core.stats імпортується ЛОКАЛЬНО (не на початку файлу) з тієї ж причини,
+    що й core.self_test у cmd_test() вище: core.stats імпортує
+    core.position_monitor, а core.position_monitor імпортує core.control_bot
+    (цей файл) для notify_owner() — імпорт на рівні модуля тут створив би
+    цикл control_bot -> stats -> position_monitor -> control_bot.
+    """
+    from core.stats import format_stats_report
+
+    period_key = callback.data.split(":", 1)[1]
+    await callback.answer()
+
+    session = get_session()
+    try:
+        report = format_stats_report(session, period_key)
+    finally:
+        session.close()
+
+    await callback.message.edit_text(report, parse_mode="HTML")
+
+
 @router.message(Command("help"), is_allowed)
 async def cmd_help(message: Message):
     role = get_role(message.from_user.id)
@@ -624,6 +663,7 @@ async def cmd_help(message: Message):
         "/balance — баланс гаманця",
         "/positions — відкриті позиції",
         "/history [N] — останні N угод (default 10)",
+        "/stats — статистика за день/тиждень/місяць (сигнали, PnL, ladder)",
     ]
     if role == "admin":
         lines += [

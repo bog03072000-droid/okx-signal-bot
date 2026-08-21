@@ -126,10 +126,13 @@ async def execute_partial_sell(
 ) -> bool:
     """
     Продає sell_raw_amount (у найменших одиницях токена) з позиції buy,
-    записує Trade і сповіщає власника. Спільна для:
+    записує Trade (з pnl_usd, див. нижче) і сповіщає власника. Спільна для
+    ЧОТИРЬОХ джерел (звідси і галузі label/source_note нижче за close_reason):
       - ladder TP/SL (_check_position нижче, close_reason напр. "stop_loss_-10pct")
-      - best-effort reply-sell евристики (main.py, close_reason
-        "reply_sell_heuristic_Xpct" — sell-згадка в reply без CA, див. README)
+      - прямий sell-сигнал з каналу (main.py:process_signal(), close_reason
+        "signal_sell" — контракт вказано явно в тексті сигналу)
+      - best-effort reply-sell евристики (main.py:process_reply_sell(),
+        close_reason "reply_sell_heuristic_Xpct" — sell-згадка в reply без CA)
       - кнопки "🧪 Тест" (core/self_test.py, force_dry_run=True) — той самий
         код ladder-логіки, форсовано без реального свопу незалежно від
         settings.dry_run, див. docstring OKXDexClient.execute_swap().
@@ -173,12 +176,25 @@ async def execute_partial_sell(
     except (TypeError, ValueError):
         amount_usd = 0.0
 
+    # --- PnL для ЦІЄЇ конкретної частки, що продається ---
+    # cost_per_raw_unit = скільки USD коштував ОДИН raw-юніт токена на вході
+    # (buy.amount_usd / buy.token_amount) — decimals довільного токена
+    # скорочуються в цьому співвідношенні, тому не треба їх окремо знати.
+    # pnl = виручка за цю частку - собівартість цієї ж частки. НЕ враховує
+    # комісії мережі/сліпедж понад те, що вже відображено в amount_usd з
+    # реального quote — окремих даних про комісії система не збирає.
+    pnl_usd = None
+    if buy.amount_usd is not None and buy.token_amount:
+        cost_basis_usd = (buy.amount_usd / buy.token_amount) * sell_raw_amount
+        pnl_usd = amount_usd - cost_basis_usd
+
     sell_trade = Trade(
         action="sell",
         token_symbol=buy.token_symbol,
         contract_address=buy.contract_address,
         chain=buy.chain,
         amount_usd=amount_usd,
+        pnl_usd=pnl_usd,
         token_amount=sell_raw_amount,
         tx_hash=swap_result.tx_hash,
         dry_run=swap_result.dry_run,
@@ -199,13 +215,22 @@ async def execute_partial_sell(
     session.add(buy)
     session.commit()
 
-    is_ladder = close_reason.startswith("stop_loss_") or close_reason.startswith("take_profit_")
-    label = f"АВТО ({close_reason})" if is_ladder else f"REPLY-SELL ({close_reason})"
-    source_note = (
-        "автоматичне спрацювання ladder TP/SL"
-        if is_ladder
-        else "best-effort розпізнавання sell у reply-повідомленні без адреси контракту (не 100% точний механізм)"
-    )
+    # close_reason визначає, звідки прийшов цей sell — три джерела ділять
+    # цю саму функцію (ladder, reply-sell евристика, прямий sell-сигнал з
+    # каналу), тому підпис у сповіщенні має відрізнятись, щоб було видно,
+    # який саме механізм спрацював.
+    if close_reason.startswith("stop_loss_") or close_reason.startswith("take_profit_"):
+        label = f"АВТО ({close_reason})"
+        source_note = "автоматичне спрацювання ladder TP/SL"
+        closing_note = "<b>НЕ сигнал з каналу</b>"
+    elif close_reason.startswith("reply_sell_heuristic_"):
+        label = f"REPLY-SELL ({close_reason})"
+        source_note = "best-effort розпізнавання sell у reply-повідомленні без адреси контракту (не 100% точний механізм)"
+        closing_note = "<b>НЕ прямий сигнал з каналу</b>"
+    else:
+        label = f"СИГНАЛ ({close_reason})"
+        source_note = "прямий sell-сигнал з каналу (адреса контракту вказана явно в тексті)"
+        closing_note = "<b>сигнал з каналу</b>"
 
     pct_note = ""
     if current_price is not None and buy.entry_price:
@@ -218,7 +243,7 @@ async def execute_partial_sell(
         f"{prefix}📐 <b>{label}</b>: SELL {buy.token_symbol} "
         f"≈${amount_usd:.2f}{pct_note}{status_note}\n"
         f"tx: {swap_result.tx_hash}\n"
-        f"Це {source_note}, <b>НЕ сигнал з каналу</b>."
+        f"Це {source_note}, {closing_note}."
     )
     logger.info(text)
     await notify_owner(text)
