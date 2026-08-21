@@ -1,11 +1,13 @@
 """
 Рантайм-стан бота, який має змінюватись "на льоту" без перезапуску процесу:
-пауза торгівлі (/stop, /start) і перевизначені ризик-ліміти (/setlimit).
+пауза торгівлі (/stop, /start), перевизначені ризик-ліміти (/setlimit) і
+список користувачів/адмінів control-бота, доданих через кнопку "👥 Користувачі"
+(окремо від TG_OWNER_USER_ID з .env — той завжди адмін, тут не зберігається).
 
-Навмисно простий JSON-файл, а не SQLite: стан тут — це буквально пара прапорців,
-окрема таблиця в БД була б зайвою абстракцією. Файл перечитується при КОЖНОМУ
-зверненні (див. risk_manager.py) — тому зміна через /setlimit діє одразу,
-а не тільки при старті процесу.
+Навмисно простий JSON-файл, а не SQLite: стан тут — це буквально пара прапорців
+і невеликий словник, окрема таблиця в БД була б зайвою абстракцією. Файл
+перечитується при КОЖНОМУ зверненні (див. risk_manager.py) — тому зміна через
+/setlimit чи додавання користувача діє одразу, а не тільки при старті процесу.
 
 Пишеться атомарно (tmp-файл + os.replace), щоб конкурентний запис з control-бота
 і читання з risk_manager не могли зустріти напівзаписаний JSON.
@@ -13,12 +15,12 @@
 import json
 import os
 import threading
-from typing import Any
+from typing import Any, Optional
 
 STATE_FILE = "data/runtime_state.json"
 _lock = threading.Lock()
 
-_DEFAULT_STATE = {"paused": False, "limit_overrides": {}}
+_DEFAULT_STATE = {"paused": False, "limit_overrides": {}, "users": {}}
 
 
 def _load() -> dict:
@@ -31,6 +33,7 @@ def _load() -> dict:
         return dict(_DEFAULT_STATE)
     data.setdefault("paused", False)
     data.setdefault("limit_overrides", {})
+    data.setdefault("users", {})
     return data
 
 
@@ -75,3 +78,38 @@ def clear_limit_override(name: str) -> bool:
             _save(data)
             return True
         return False
+
+
+def get_users() -> dict:
+    """
+    {user_id_str: "admin"|"user"} — користувачі/адміни, додані через control-бота.
+    НЕ включає TG_OWNER_USER_ID з .env — той завжди адмін окремо, поза цим
+    списком (щоб власника неможливо було випадково "видалити" через бота).
+    """
+    with _lock:
+        return dict(_load().get("users", {}))
+
+
+def add_user(user_id: int, role: str) -> None:
+    if role not in ("admin", "user"):
+        raise ValueError(f"Невідома роль: {role!r}, очікується 'admin' або 'user'")
+    with _lock:
+        data = _load()
+        data["users"][str(user_id)] = role
+        _save(data)
+
+
+def remove_user(user_id: int) -> bool:
+    with _lock:
+        data = _load()
+        if str(user_id) in data["users"]:
+            del data["users"][str(user_id)]
+            _save(data)
+            return True
+        return False
+
+
+def get_user_role(user_id: int) -> Optional[str]:
+    """'admin'/'user' для доданих через бота користувачів, або None якщо не в списку."""
+    with _lock:
+        return _load().get("users", {}).get(str(user_id))
