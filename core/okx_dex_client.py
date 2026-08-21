@@ -154,18 +154,34 @@ class OKXDexClient:
         wallet_address: str,
         slippage_pct: float,
         chain_id: str = SOLANA_CHAIN_ID,
+        force_dry_run: bool = False,
     ) -> SwapResult:
         """
-        Виконує реальний своп. В DRY_RUN режимі повертає симуляцію без реального виклику.
+        Виконує реальний своп. В DRY_RUN режимі (або коли force_dry_run=True)
+        повертає симуляцію без реального виклику.
+
+        force_dry_run — ОКРЕМИЙ від settings.dry_run прапорець. Використовується
+        ВИКЛЮЧНО кнопкою "🧪 Тест" (core/self_test.py), яка МАЄ гарантовано
+        ніколи не відправляти реальну транзакцію, НАВІТЬ якщо бот зараз працює
+        в DRY_RUN=false (live). Якби перевірка спиралась лише на settings.dry_run,
+        тест перевіряв би реальний live-шлях лише тоді, коли settings.dry_run
+        сам по собі False — тобто саме тоді, коли ціна помилки найвища, а
+        джерело "чи виконати реально" — це один загальний прапорець з .env,
+        яким могла б випадково маніпулювати інша частина коду чи майбутня
+        зміна конфігурації. force_dry_run — явний параметр, переданий
+        буквально літералом True з місця виклику тесту (див.
+        core/self_test.py, дивись коментар "ЛІТЕРАЛ" там) — його неможливо
+        випадково "забути" виставити чи підмінити через .env.
         """
-        if settings.dry_run:
+        if settings.dry_run or force_dry_run:
+            tx_hash = "TEST_SIMULATION_NO_TX" if force_dry_run and not settings.dry_run else "DRY_RUN_NO_TX"
             logger.info(
-                f"[DRY RUN] Своп: {amount_raw} {from_token} -> {to_token} "
+                f"[{'TEST' if force_dry_run else 'DRY RUN'}] Своп: {amount_raw} {from_token} -> {to_token} "
                 f"(slippage {slippage_pct}%) — БЕЗ реального виконання"
             )
-            return SwapResult(success=True, tx_hash="DRY_RUN_NO_TX", dry_run=True)
+            return SwapResult(success=True, tx_hash=tx_hash, dry_run=True)
 
-        # --- Реальний виклик (тільки коли DRY_RUN=false) ---
+        # --- Реальний виклик (тільки коли DRY_RUN=false І force_dry_run=False) ---
         path = "/api/v5/dex/aggregator/swap"
         params = {
             "chainId": chain_id,

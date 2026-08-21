@@ -112,6 +112,7 @@ ADMIN_KEYBOARD = ReplyKeyboardMarkup(
         [KeyboardButton(text="📈 Позиції"), KeyboardButton(text="📜 Історія")],
         [KeyboardButton(text="⏸ Стоп"), KeyboardButton(text="▶️ Старт")],
         [KeyboardButton(text="⚙️ Ліміти"), KeyboardButton(text="👥 Користувачі")],
+        [KeyboardButton(text="🧪 Тест")],
     ],
     resize_keyboard=True,
     is_persistent=True,
@@ -587,6 +588,33 @@ async def cb_users(callback: CallbackQuery, state: FSMContext):
     await callback.answer()
 
 
+@router.message(Command("test"), is_admin)
+@router.message(F.text == "🧪 Тест", is_admin)
+async def cmd_test(message: Message):
+    """
+    Повний тестовий прогін торгового пайплайну + ladder TP/SL — ГАРАНТОВАНО
+    симуляція, незалежно від DRY_RUN у .env (див. core/self_test.py і
+    force_dry_run у core/okx_dex_client.py:OKXDexClient.execute_swap()).
+
+    core.self_test імпортується ЛОКАЛЬНО (не на початку файлу) навмисно:
+    core.self_test імпортує core.position_monitor, а core.position_monitor
+    імпортує core.control_bot (цей файл) для notify_owner() — імпорт
+    self_test на рівні модуля тут створив би цикл control_bot -> self_test ->
+    position_monitor -> control_bot. Локальний імпорт всередині хендлера
+    спрацьовує без проблем, бо на момент першого натискання кнопки всі три
+    модулі вже повністю завантажені (main.py імпортує їх усі при старті).
+    """
+    from core.self_test import run_buy_signal_test, run_ladder_test
+
+    await message.answer("🧪 Запускаю тестовий прогін (buy-сигнал)...")
+    buy_report = await run_buy_signal_test()
+    await message.answer("\n".join(buy_report), parse_mode="HTML")
+
+    await message.answer("🧪 Запускаю тестовий прогін (ladder TP/SL)...")
+    ladder_report = await run_ladder_test()
+    await message.answer("\n".join(ladder_report), parse_mode="HTML")
+
+
 @router.message(Command("help"), is_allowed)
 async def cmd_help(message: Message):
     role = get_role(message.from_user.id)
@@ -604,6 +632,7 @@ async def cmd_help(message: Message):
             "/limits — поточні ризик-ліміти (+ кнопки для зміни)",
             "/setlimit НАЗВА значення — змінити ліміт на льоту",
             "/users — керування користувачами control-бота",
+            "/test — тестовий прогін пайплайну + ladder TP/SL (завжди симуляція)",
         ]
     lines.append(
         "\nКнопкове меню під полем вводу дублює основні команди — це паралельний "

@@ -122,6 +122,7 @@ def remaining_amount(session, buy: Trade) -> float:
 
 async def execute_partial_sell(
     session, buy: Trade, close_reason: str, sell_raw_amount: float, current_price: float = None,
+    force_dry_run: bool = False,
 ) -> bool:
     """
     Продає sell_raw_amount (у найменших одиницях токена) з позиції buy,
@@ -129,6 +130,9 @@ async def execute_partial_sell(
       - ladder TP/SL (_check_position нижче, close_reason напр. "stop_loss_-10pct")
       - best-effort reply-sell евристики (main.py, close_reason
         "reply_sell_heuristic_Xpct" — sell-згадка в reply без CA, див. README)
+      - кнопки "🧪 Тест" (core/self_test.py, force_dry_run=True) — той самий
+        код ladder-логіки, форсовано без реального свопу незалежно від
+        settings.dry_run, див. docstring OKXDexClient.execute_swap().
 
     current_price — якщо відомий, у сповіщенні показується % зміни від
     entry_price; якщо None (напр. свіжий price lookup не вдався) — без %.
@@ -158,6 +162,7 @@ async def execute_partial_sell(
         wallet_address="<буде підставлено з гаманця>",
         slippage_pct=settings.max_slippage_pct,
         chain_id="501",
+        force_dry_run=force_dry_run,
     )
 
     # amount_usd — з quote.to_amount (реальна кількість USDT за курсом свопу),
@@ -220,7 +225,13 @@ async def execute_partial_sell(
     return swap_result.success
 
 
-async def _check_position(session, buy: Trade, current_price: float):
+async def _check_position(session, buy: Trade, current_price: float, force_dry_run: bool = False):
+    """
+    force_dry_run — прокидається напряму в execute_partial_sell()/execute_swap();
+    True лише коли викликається з core/self_test.py (кнопка "🧪 Тест"). За
+    замовчуванням False — реальний position_monitor_loop() його не передає
+    взагалі, тож поведінка проду абсолютно незмінна.
+    """
     triggered = _triggered_levels(buy)
     pct_change = (current_price - buy.entry_price) / buy.entry_price
 
@@ -252,7 +263,7 @@ async def _check_position(session, buy: Trade, current_price: float):
         base_amount = (buy.token_amount or 0.0) if basis == "initial" else remaining
         sell_amount = min(base_amount * fraction, remaining)
 
-        await execute_partial_sell(session, buy, level_code, sell_amount, current_price)
+        await execute_partial_sell(session, buy, level_code, sell_amount, current_price, force_dry_run=force_dry_run)
 
 
 async def position_monitor_loop():
