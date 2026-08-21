@@ -14,6 +14,7 @@ import logging
 import time
 from dataclasses import dataclass
 from typing import Optional
+from urllib.parse import urlencode
 
 import httpx
 
@@ -73,23 +74,46 @@ class OKXDexClient:
     def __init__(self):
         self.client = httpx.Client(timeout=15.0)
 
-    def _sign(self, timestamp: str, method: str, path: str, body: str = "") -> str:
-        message = f"{timestamp}{method}{path}{body}"
+    def _sign(self, timestamp: str, method: str, request_path: str, body: str = "") -> str:
+        message = f"{timestamp}{method}{request_path}{body}"
         signature = hmac.new(
             settings.okx_secret_key.encode(), message.encode(), hashlib.sha256
         ).digest()
         return base64.b64encode(signature).decode()
 
-    def _headers(self, method: str, path: str, body: str = "") -> dict:
+    def _headers(self, method: str, request_path: str, body: str = "") -> dict:
+        """
+        request_path МАЄ включати query-string для GET-запитів (напр.
+        "/api/v5/dex/aggregator/quote?chainId=501&amount=..."), інакше підпис
+        не збігається з реальним запитом і OKX повертає 401 Unauthorized —
+        сам факт наявності правильних ключів тут не рятує, підпис рахується
+        не з того рядка. Джерело: офіційна документація OKX V5 API,
+        https://www.okx.com/docs-v5/en/#overview-rest-authentication —
+        приклад підпису явно включає query-string:
+        timestamp + 'GET' + '/api/v5/account/balance?ccy=BTC' + secretKey.
+        """
         timestamp = str(int(time.time() * 1000))
         return {
             "OK-ACCESS-KEY": settings.okx_api_key,
-            "OK-ACCESS-SIGN": self._sign(timestamp, method, path, body),
+            "OK-ACCESS-SIGN": self._sign(timestamp, method, request_path, body),
             "OK-ACCESS-TIMESTAMP": timestamp,
             "OK-ACCESS-PASSPHRASE": settings.okx_passphrase,
             "OK-ACCESS-PROJECT": settings.okx_project_id,
             "Content-Type": "application/json",
         }
+
+    @staticmethod
+    def _build_url_and_signed_path(path: str, params: dict) -> tuple[str, str]:
+        """
+        Будує query-string ОДИН РАЗ і використовує той самий рядок і для
+        реального запиту, і для підпису — щоб гарантовано збігались. Раніше
+        query-string передавався в httpx окремо через params=, а підписувався
+        лише голий path без параметрів — це і давало 401 Unauthorized
+        (сигнатура рахувалась не з того, що реально йшло в запиті).
+        """
+        query_string = urlencode(params)
+        request_path = f"{path}?{query_string}" if query_string else path
+        return OKX_BASE_URL + request_path, request_path
 
     def get_quote(
         self, from_token: str, to_token: str, amount_raw: str, chain_id: str = SOLANA_CHAIN_ID
@@ -102,12 +126,9 @@ class OKXDexClient:
             "toTokenAddress": to_token,
             "amount": amount_raw,
         }
+        url, request_path = self._build_url_and_signed_path(path, params)
         try:
-            resp = self.client.get(
-                OKX_BASE_URL + path,
-                params=params,
-                headers=self._headers("GET", path),
-            )
+            resp = self.client.get(url, headers=self._headers("GET", request_path))
             resp.raise_for_status()
             data = resp.json()
             if data.get("code") != "0":
@@ -154,12 +175,9 @@ class OKXDexClient:
             "userWalletAddress": wallet_address,
             "slippage": str(slippage_pct / 100),
         }
+        url, request_path = self._build_url_and_signed_path(path, params)
         try:
-            resp = self.client.get(
-                OKX_BASE_URL + path,
-                params=params,
-                headers=self._headers("GET", path),
-            )
+            resp = self.client.get(url, headers=self._headers("GET", request_path))
             resp.raise_for_status()
             data = resp.json()
             if data.get("code") != "0":

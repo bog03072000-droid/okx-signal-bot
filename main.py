@@ -216,6 +216,21 @@ async def process_signal(client: TelegramClient, message_text: str):
         # amount_raw — у найменших одиницях USDT (6 decimals, на відміну від 9 у SOL/lamports)
         amount_raw = str(int(position_size_usd * (10 ** USDT_DECIMALS)))
 
+        if int(amount_raw) <= 0:
+            # Найчастіша причина — гаманець ще не поповнений USDT (баланс 0,
+            # тож і calculate_position_size() дає 0). Без цієї перевірки бот
+            # робив би реальний запит quote до OKX з amount=0 щоразу на кожен
+            # сигнал — зайве навантаження на API і незрозуміла помилка від
+            # OKX замість чіткої причини тут.
+            reason = (
+                "Розрахований розмір угоди — 0 USDT (ймовірно, баланс USDT порожній). "
+                "Сигнал відхилено без запиту quote."
+            )
+            log_entry.rejection_reason = reason
+            session.add(log_entry)
+            session.commit()
+            return parsed
+
         quote = dex.get_quote(from_addr, to_addr, amount_raw)
         if not quote.success:
             log_entry.rejection_reason = f"Помилка отримання quote: {quote.error}"
