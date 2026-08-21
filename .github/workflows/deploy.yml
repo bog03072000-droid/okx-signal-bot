@@ -1,0 +1,46 @@
+name: Deploy to DigitalOcean
+
+# Спрацьовує лише на push у main. Білд Docker-образу відбувається ПРЯМО НА
+# droplet'і (git pull + docker compose build), без окремого registry (Docker
+# Hub/GHCR) — менше рухомих частин для першого налаштування. Якщо образ
+# стане важким і збірка на droplet повільною, варто перейти на build-and-push
+# в GitHub Actions + docker pull на сервері.
+on:
+  push:
+    branches: [main]
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Deploy via SSH
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.DROPLET_HOST }}
+          username: ${{ secrets.DROPLET_USER }}
+          key: ${{ secrets.DROPLET_SSH_KEY }}
+          script: |
+            set -e
+            cd /opt/okx-signal-bot
+            git pull origin main
+            docker compose build
+            docker compose up -d
+
+            echo "Чекаємо на healthcheck контейнера..."
+            for i in $(seq 1 15); do
+              status=$(docker inspect -f '{{.State.Health.Status}}' okx-signal-bot 2>/dev/null || echo "unknown")
+              if [ "$status" = "healthy" ]; then
+                echo "Деплой успішний, контейнер healthy."
+                exit 0
+              fi
+              if [ "$status" = "unhealthy" ]; then
+                echo "УВАГА: контейнер unhealthy. Останні логи:"
+                docker logs --tail 50 okx-signal-bot
+                exit 1
+              fi
+              sleep 6
+            done
+
+            echo "УВАГА: контейнер не став healthy за ~90с. Останні логи:"
+            docker logs --tail 50 okx-signal-bot
+            exit 1

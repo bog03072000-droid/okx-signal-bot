@@ -1,0 +1,10 @@
+services:
+  bot:
+    build: .
+    container_name: okx-signal-bot
+    restart: unless-stopped
+    env_file: .env
+    volumes:
+      # data/ живе на хості, щоб SQLite (data/bot.db) і Telethon-сесія
+      # переживали передеплой/пересборку образу
+      - ./data:/app/data

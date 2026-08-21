@@ -1,0 +1,19 @@
+[Unit]
+Description=OKX Signal Bot (Telegram listener + control bot)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=botuser
+WorkingDirectory=/opt/okx-signal-bot
+EnvironmentFile=/opt/okx-signal-bot/.env
+ExecStart=/opt/okx-signal-bot/.venv/bin/python /opt/okx-signal-bot/main.py
+Restart=always
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=okx-signal-bot
+
+[Install]
+WantedBy=multi-user.target
