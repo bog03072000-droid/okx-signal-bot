@@ -25,6 +25,7 @@ Ladder-логіка (_check_position, remaining_amount, _triggered_levels)
 імпортується напряму з core/position_monitor.py — той самий, не copy-paste
 код, що працює в реальному position_monitor_loop().
 """
+import asyncio
 import logging
 
 from core.config import settings, get_limit
@@ -74,6 +75,15 @@ TEST_SIGNAL_TEXT = "16k, дев очень жир JACCJHVy2QC96VNJK1iMrqYwMQPBbH
 # за адресою контракту.
 TEST_LADDER_CONTRACT = "So11111111111111111111111111111111111111112"  # Wrapped SOL mint
 TEST_LADDER_TOKEN_SYMBOL = "TEST_TOKEN"
+
+# Пауза між послідовними quote-викликами всередині run_ladder_test().
+# ПЕРЕВІРЕНО на реальному деплої (docker logs): без паузи 6 quote-запитів
+# підряд (діагностика + 2×SL + 3×TP) впираються в rate limit OKX —
+# "429 Too Many Requests" на 4-му+ запиті за частку секунди. Реальний
+# position_monitor_loop() робить лише 1 такий запит на позицію раз/2с,
+# тому цей rate limit — це артефакт саме тесту (він б'є по API набагато
+# швидше за прод), а НЕ баг ladder-логіки і не проблема реальної торгівлі.
+QUOTE_CALL_DELAY_SECONDS = 1.0
 
 
 def _ok(msg: str) -> str:
@@ -262,7 +272,19 @@ async def run_ladder_test() -> list[str]:
         buy_sl = Trade(
             action="buy", token_symbol=TEST_LADDER_TOKEN_SYMBOL,
             contract_address=TEST_LADDER_CONTRACT,
-            chain="solana", amount_usd=10.0, tx_hash="TEST_SIMULATION_NO_TX",
+            # chain="solana_test", НЕ "solana" — ПЕРЕВІРЕНО на реальному
+            # деплої (docker logs): справжній фоновий position_monitor_loop()
+            # фільтрує позиції рівно по Trade.chain=="solana" і бере ВЖЕ
+            # ігнорує chain, тому раніше він бачив ці тимчасові тестові
+            # рядки як звичайну відкриту позицію (справжня адреса контракту +
+            # entry_price/token_amount задані) і сам, незалежно від сценарію
+            # тесту, продавав їх по РЕАЛЬНІЙ ринковій ціні Wrapped SOL —
+            # спостерігали в логах "+9421900.0% від входу" (реальна ціна ~$94
+            # проти фейкового entry_price=0.001 тесту), що гонково спотворювало
+            # результати послідовних кроків run_ladder_test(). Прямі виклики
+            # _check_position() нижче не залежать від Trade.chain і тому не
+            # зачіпаються цією зміною.
+            chain="solana_test", amount_usd=10.0, tx_hash="TEST_SIMULATION_NO_TX",
             dry_run=True, status="confirmed",
             entry_price=entry_price, token_amount=1_000_000.0,
             triggered_levels="[]",
@@ -270,6 +292,9 @@ async def run_ladder_test() -> list[str]:
         session.add(buy_sl)
         session.commit()
 
+        # Пауза перед КОЖНИМ наступним quote-викликом нижче — див. коментар
+        # QUOTE_CALL_DELAY_SECONDS вище (без неї — 429 від OKX).
+        await asyncio.sleep(QUOTE_CALL_DELAY_SECONDS)
         price_sl10 = entry_price * 0.90
         lines.append(f"Сценарій SL: вхід ${entry_price:g} → ціна ${price_sl10:g} (-10%)")
         # force_dry_run=True — ЛІТЕРАЛ, той самий сенс, що й у run_buy_signal_test().
@@ -281,6 +306,7 @@ async def run_ladder_test() -> list[str]:
             lines.append(_fail("Рівень -10% НЕ спрацював (баг у ladder-логіці, дивись position_monitor.py)"))
         lines.append("")
 
+        await asyncio.sleep(QUOTE_CALL_DELAY_SECONDS)
         price_sl20 = entry_price * 0.80
         lines.append(f"Сценарій SL: ціна впала до ${price_sl20:g} (-20% від входу)")
         await _check_position(session, buy_sl, price_sl20, force_dry_run=True)
@@ -296,7 +322,8 @@ async def run_ladder_test() -> list[str]:
         buy_tp = Trade(
             action="buy", token_symbol=TEST_LADDER_TOKEN_SYMBOL,
             contract_address=TEST_LADDER_CONTRACT,
-            chain="solana", amount_usd=10.0, tx_hash="TEST_SIMULATION_NO_TX",
+            # chain="solana_test" — див. коментар при створенні buy_sl вище.
+            chain="solana_test", amount_usd=10.0, tx_hash="TEST_SIMULATION_NO_TX",
             dry_run=True, status="confirmed",
             entry_price=entry_price, token_amount=1_000_000.0,
             triggered_levels="[]",
@@ -310,6 +337,7 @@ async def run_ladder_test() -> list[str]:
             (1.00, "take_profit_+100pct", "+100%", "продано решту (позиція закрита)"),
         ]
         for pct, level_code, label, expect_desc in tp_steps:
+            await asyncio.sleep(QUOTE_CALL_DELAY_SECONDS)
             price = entry_price * (1 + pct)
             lines.append(f"Сценарій TP: вхід ${entry_price:g} → ціна ${price:g} ({label})")
             await _check_position(session, buy_tp, price, force_dry_run=True)
