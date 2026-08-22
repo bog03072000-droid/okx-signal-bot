@@ -1,6 +1,17 @@
 """
 Клієнт для OKX DEX (Web3) Aggregator API.
-Документація: https://web3.okx.com/build/dev-docs/dex-api/dex-what-is-dex-api
+
+Документація (перевірено наживо 2026-08-22, стара v5-адреса вже 404):
+  https://web3.okx.com/onchainos/dev-docs/trade/dex-get-quote
+  https://web3.okx.com/onchainos/dev-docs/trade/dex-swap
+
+СКЕПТИЧНИЙ КОМЕНТАР: OKX вже ОДИН РАЗ повністю прибрав V5 API без довгого
+запасного періоду (реальна помилка з продакшна: "V5 API is being
+deprecated. Please refer to our documentation and upgrade to the latest
+V6 API for continued access.") — код нижче використовує V6, але немає
+жодної гарантії, що OKX не зробить те саме з V6 колись. Якщо `get_quote()`
+раптом почне валитись з подібною помилкою — перше, що перевіряти, це чи
+не змінилась версія API знову, а не шукати баг деінде.
 
 ВАЖЛИВО: справжній підпис запитів OKX API вимагає HMAC-SHA256 підпису
 (timestamp + method + path + body) — реалізовано нижче в _sign().
@@ -118,10 +129,20 @@ class OKXDexClient:
     def get_quote(
         self, from_token: str, to_token: str, amount_raw: str, chain_id: str = SOLANA_CHAIN_ID
     ) -> QuoteResult:
-        """Отримує котирування свопу (без виконання транзакції)."""
-        path = "/api/v5/dex/aggregator/quote"
+        """
+        Отримує котирування свопу (без виконання транзакції).
+
+        price_impact_pct — це OKX V6 "priceImpactPercent", НЕ той знак, що
+        інтуїтивно очікуєш: за офіційним визначенням OKX це
+        (отримано - заплачено) / заплачено, тобто ДОДАТНЄ значення = вигідніше
+        за очікуване (більше отримав), ВІД'ЄМНЕ = гірше за очікуване (менше
+        отримав, тобто "класичний" price impact). Перевірка ліміту
+        (core/risk_manager.py:check_price_impact) враховує цей інвертований
+        знак — не переплутай при зміні цього коду.
+        """
+        path = "/api/v6/dex/aggregator/quote"
         params = {
-            "chainId": chain_id,
+            "chainIndex": chain_id,
             "fromTokenAddress": from_token,
             "toTokenAddress": to_token,
             "amount": amount_raw,
@@ -139,7 +160,7 @@ class OKXDexClient:
                 success=True,
                 from_amount=quote_data.get("fromTokenAmount"),
                 to_amount=quote_data.get("toTokenAmount"),
-                price_impact_pct=float(quote_data.get("priceImpactPercentage", 0)),
+                price_impact_pct=float(quote_data.get("priceImpactPercent", 0)),
                 tx_data=quote_data,
             )
         except Exception as e:
@@ -182,14 +203,17 @@ class OKXDexClient:
             return SwapResult(success=True, tx_hash=tx_hash, dry_run=True)
 
         # --- Реальний виклик (тільки коли DRY_RUN=false І force_dry_run=False) ---
-        path = "/api/v5/dex/aggregator/swap"
+        path = "/api/v6/dex/aggregator/swap"
         params = {
-            "chainId": chain_id,
+            "chainIndex": chain_id,
             "fromTokenAddress": from_token,
             "toTokenAddress": to_token,
             "amount": amount_raw,
             "userWalletAddress": wallet_address,
-            "slippage": str(slippage_pct / 100),
+            # V6 slippagePercent — це вже сам відсоток (0.5 = 0.5%), а НЕ
+            # частка (на відміну від старого v5 "slippage", де 3% писалось
+            # як 0.03). Ділити на 100 тут НЕ треба.
+            "slippagePercent": str(slippage_pct),
         }
         url, request_path = self._build_url_and_signed_path(path, params)
         try:

@@ -102,12 +102,24 @@ class RiskManager:
         return wallet_balance_usd * (get_limit("MAX_POSITION_PCT") / 100)
 
     def check_price_impact(self, price_impact_pct: float) -> RiskCheckResult:
+        """
+        price_impact_pct приходить з OKXDexClient.get_quote() у знаку OKX V6:
+        ДОДАТНЄ = отримав БІЛЬШЕ за очікуване (вигідно, ніколи не привід
+        відхиляти), ВІД'ЄМНЕ = отримав МЕНШЕ за очікуване (класичний price
+        impact, ось це і обмежуємо). Тому поріг MAX_PRICE_IMPACT_PCT (завжди
+        задається додатним числом в .env, напр. 5.0) звіряється з
+        -price_impact_pct, а НЕ з price_impact_pct напряму — старий код
+        (`price_impact_pct > max_impact`) писався під V5, де знак був
+        протилежний, і після переходу на V6 просто ніколи б не спрацював
+        (реальний invalide price impact майже завжди від'ємний за цим
+        визначенням, а від'ємне число не може бути "> 5.0").
+        """
         max_impact = get_limit("MAX_PRICE_IMPACT_PCT")
-        if price_impact_pct > max_impact:
+        if -price_impact_pct > max_impact:
             return RiskCheckResult(
                 allowed=False,
                 reason=(
-                    f"Price impact {price_impact_pct:.2f}% перевищує максимум "
+                    f"Price impact {price_impact_pct:.2f}% (невигідний бік) перевищує максимум "
                     f"{max_impact}%"
                 ),
             )

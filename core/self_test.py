@@ -31,7 +31,7 @@ from core.config import settings, get_limit
 from core.signal_parser import SignalParser
 from core.token_screener import TokenScreener
 from core.risk_manager import RiskManager
-from core.okx_dex_client import OKXDexClient, USDT_MINT_SOLANA, USDT_DECIMALS, SOL_NATIVE_ADDRESS
+from core.okx_dex_client import OKXDexClient, USDT_MINT_SOLANA, USDT_DECIMALS
 from core.wallet import get_wallet_balance, MOCK_WALLET_BALANCE_USD
 from core.storage import get_session, Trade
 from core.position_monitor import _check_position, _triggered_levels, remaining_amount
@@ -49,18 +49,30 @@ _dex = OKXDexClient()
 TEST_SIGNAL_TEXT = "16k, дев очень жир JACCJHVy2QC96VNJK1iMrqYwMQPBbHNna2oEnxEPpump"
 
 # Контракт для симульованих ladder-позицій — СВІДОМО справжня, завжди
-# ліквідна адреса (native SOL), а НЕ вигадана. get_quote() у _check_position()
-# / execute_partial_sell() (core/position_monitor.py) НІКОЛИ не гейтиться
+# ліквідна адреса, а НЕ вигадана. get_quote() у _check_position()/
+# execute_partial_sell() (core/position_monitor.py) НІКОЛИ не гейтиться
 # dry_run/force_dry_run — це завжди РЕАЛЬНИЙ (але суто інформаційний,
 # нічого не рухає) запит до OKX за котируванням. Вигадана неіснуюча адреса
 # змусила б OKX відхилити quote в реальному деплої з реальними ключами —
 # і ladder-тест хибно показував би "рівень не спрацював" через відсутність
-# котирування, а не через реальний баг. Плутанини з "торгівлею SOL" це не
+# котирування, а не через реальний баг.
+#
+# ВАЖЛИВО, перевірено на реальному деплої (не з пам'яті): тут НЕ можна
+# використовувати core.okx_dex_client.SOL_NATIVE_ADDRESS
+# ("11111111111111111111111111111111") — це насправді Solana System
+# Program ID, не SPL-токен. Деякі агрегатори (Jupiter) приймають цю адресу
+# як умовне позначення "нативний SOL" і самі його (роз)обгортають, але OKX
+# DEX Aggregator API так НЕ робить — quote з цією адресою відхиляється.
+# Офіційний приклад OKX (github.com/okx/dex-api-library) використовує саме
+# WRAPPED SOL mint нижче. Перевірено ще й напряму по RPC (getAccountInfo):
+# decimals=9, owner=TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA (стандартна
+# SPL Token Program) — це справжній, котируваний токен, на відміну від
+# SOL_NATIVE_ADDRESS. Плутанини з "торгівлею SOL" використання тут не
 # створює: сам своп все одно НІКОЛИ не виконується (force_dry_run=True),
 # а Trade-рядки позначені token_symbol=TEST_LADDER_TOKEN_SYMBOL нижче —
 # саме за цим полем відбувається і показ, і прибирання після тесту, а не
 # за адресою контракту.
-TEST_LADDER_CONTRACT = SOL_NATIVE_ADDRESS
+TEST_LADDER_CONTRACT = "So11111111111111111111111111111111111111112"  # Wrapped SOL mint
 TEST_LADDER_TOKEN_SYMBOL = "TEST_TOKEN"
 
 
@@ -229,6 +241,22 @@ async def run_ladder_test() -> list[str]:
     lines = ["🧪 <b>ТЕСТ Ladder TP/SL (симуляція, без реальних угод)</b>", ""]
     entry_price = 0.001
 
+    # Діагностична перевірка ПЕРЕД усіма сценаріями: get_quote() для
+    # TEST_LADDER_CONTRACT — той самий виклик, що піде на кожен рівень
+    # нижче. Якщо він не проходить (напр. проблема з OKX-ключами чи
+    # мережею) — усі 5 рівнів однаково "не спрацюють" з тієї самої причини,
+    # і без цієї перевірки звіт показував би незрозуміле "баг у
+    # ladder-логіці" 5 разів замість справжньої причини один раз.
+    diagnostic = _dex.get_quote(TEST_LADDER_CONTRACT, USDT_MINT_SOLANA, "1000000")
+    if not diagnostic.success:
+        lines.append(_fail(f"Діагностика quote() для тестового контракту не пройшла: {diagnostic.error}"))
+        lines.append(
+            "Це проблема отримання котирування від OKX (ключі/мережа/самі API), "
+            "а НЕ баг у ladder-логіці — рівні нижче не тестуються, бо всі "
+            "однаково впали б на цьому ж кроці."
+        )
+        return lines
+
     session = get_session()
     try:
         buy_sl = Trade(
@@ -296,7 +324,7 @@ async def run_ladder_test() -> list[str]:
     finally:
         try:
             # Прибирання за token_symbol, НЕ за адресою контракту — TEST_LADDER_CONTRACT
-            # тепер справжня адреса (SOL_NATIVE_ADDRESS, див. коментар вище), і
+            # тепер справжня адреса (Wrapped SOL mint, див. коментар вище), і
             # видаляти за нею було б небезпечно, якби колись з'явився реальний
             # Trade-рядок з тим самим contract_address. Дочірні sell-рядки, які
             # створює execute_partial_sell(), успадковують token_symbol від
