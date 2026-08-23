@@ -49,8 +49,9 @@ from sqlalchemy import func
 
 from core import runtime_state
 from core.config import settings, LIMIT_FIELDS, get_limit, is_limit_overridden
-from core.storage import get_session, SignalLog, Trade
+from core.storage import get_session, SignalLog, Trade, TEST_TOKEN_SYMBOL
 from core.wallet import get_wallet_balance
+from core.formatting import display_token_symbol
 
 logger = logging.getLogger(__name__)
 
@@ -303,11 +304,16 @@ async def cmd_balance(message: Message):
 
 
 def _open_positions_total_usd(session) -> float:
+    # .isnot(TEST_TOKEN_SYMBOL), не "!=" — token_symbol часто NULL, а "!="
+    # в SQL мовчки виключив би й ці рядки разом з тестовими (див. коментар
+    # в core/stats.py:_compute_trade_stats).
     buys = session.query(func.sum(Trade.amount_usd)).filter(
-        Trade.action == "buy", Trade.status == "confirmed"
+        Trade.action == "buy", Trade.status == "confirmed",
+        Trade.token_symbol.isnot(TEST_TOKEN_SYMBOL),
     ).scalar() or 0.0
     sells = session.query(func.sum(Trade.amount_usd)).filter(
-        Trade.action == "sell", Trade.status == "confirmed"
+        Trade.action == "sell", Trade.status == "confirmed",
+        Trade.token_symbol.isnot(TEST_TOKEN_SYMBOL),
     ).scalar() or 0.0
     return max(buys - sells, 0.0)
 
@@ -317,30 +323,46 @@ def _open_positions_total_usd(session) -> float:
 async def cmd_positions(message: Message):
     session = get_session()
     try:
-        # Групування "відкритих" позицій по токену: сума buy мінус сума sell в USD.
-        # Це НЕ реальна кількість токенів і НЕ поточний PnL — просто скільки USD
-        # ще "в грі" по токену станом на ціни купівлі. Реальний PnL вимагає окремого
-        # моніторингу поточної ціни токена (не реалізовано, див. README).
+        # Групування "відкритих" позицій ПО КОНТРАКТУ (не по token_symbol!) —
+        # token_symbol часто NULL (SignalParser не завжди має звідки взяти
+        # тікер, див. core/formatting.py:display_token_symbol), і групування
+        # по token_symbol раніше зливало ВСІ токени без тікера в одну спільну
+        # групу "None", помилково підсумовуючи USD непов'язаних позицій разом.
+        # func.max(token_symbol) бере тікер там, де він є, для показу.
+        # Сума buy мінус сума sell в USD — НЕ реальна кількість токенів і НЕ
+        # поточний PnL, просто скільки USD ще "в грі" по позиції станом на
+        # ціни купівлі. Реальний PnL вимагає окремого моніторингу поточної
+        # ціни (не реалізовано, див. README).
+        # Trade.token_symbol.isnot(TEST_TOKEN_SYMBOL) — виключає тестові
+        # угоди від кнопки "🧪 Тест" (isnot(), не "!=", щоб не зачепити й
+        # реальні рядки з token_symbol=NULL, див. коментар в core/stats.py).
         rows = session.query(
-            Trade.token_symbol,
+            Trade.contract_address,
+            func.max(Trade.token_symbol),
             Trade.action,
             func.sum(Trade.amount_usd),
-        ).filter(Trade.status == "confirmed").group_by(Trade.token_symbol, Trade.action).all()
+        ).filter(
+            Trade.status == "confirmed",
+            Trade.token_symbol.isnot(TEST_TOKEN_SYMBOL),
+        ).group_by(Trade.contract_address, Trade.action).all()
 
-        net_by_token: dict[str, float] = {}
-        for token_symbol, action, total in rows:
-            net_by_token.setdefault(token_symbol, 0.0)
-            net_by_token[token_symbol] += total if action == "buy" else -total
+        net_by_contract: dict[str, list] = {}  # contract -> [net_usd, token_symbol]
+        for contract_address, token_symbol, action, total in rows:
+            entry = net_by_contract.setdefault(contract_address, [0.0, token_symbol])
+            entry[0] += total if action == "buy" else -total
+            if token_symbol:
+                entry[1] = token_symbol
 
-        open_positions = {t: v for t, v in net_by_token.items() if v > 0.01}
+        open_positions = {c: v for c, v in net_by_contract.items() if v[0] > 0.01}
 
         if not open_positions:
             await message.answer("📭 Немає відкритих позицій.")
             return
 
         lines = ["📈 <b>Відкриті позиції</b> (PnL н/д — без моніторингу ціни в реальному часі)"]
-        for token, usd in sorted(open_positions.items(), key=lambda x: -x[1]):
-            lines.append(f"• {token}: ≈ ${usd:,.2f}")
+        for contract_address, (usd, token_symbol) in sorted(open_positions.items(), key=lambda x: -x[1][0]):
+            label = display_token_symbol(token_symbol, contract_address)
+            lines.append(f"• {label}: ≈ ${usd:,.2f}")
         await message.answer("\n".join(lines), parse_mode="HTML")
     finally:
         session.close()
@@ -349,7 +371,11 @@ async def cmd_positions(message: Message):
 async def _send_history(message: Message, limit: int):
     session = get_session()
     try:
-        trades = session.query(Trade).order_by(Trade.created_at.desc()).limit(limit).all()
+        # .isnot(TEST_TOKEN_SYMBOL) — виключає тестові угоди від кнопки
+        # "🧪 Тест" (див. коментар в core/stats.py щодо чому isnot(), не "!=").
+        trades = session.query(Trade).filter(
+            Trade.token_symbol.isnot(TEST_TOKEN_SYMBOL)
+        ).order_by(Trade.created_at.desc()).limit(limit).all()
         if not trades:
             await message.answer("Історія угод порожня.")
             return
@@ -358,8 +384,9 @@ async def _send_history(message: Message, limit: int):
         for t in trades:
             prefix = "🧪" if t.dry_run else "💵"
             ts = t.created_at.strftime("%Y-%m-%d %H:%M")
+            label = display_token_symbol(t.token_symbol, t.contract_address)
             lines.append(
-                f"{prefix} {ts} | {t.action.upper()} {t.token_symbol} "
+                f"{prefix} {ts} | {t.action.upper()} {label} "
                 f"${t.amount_usd:.2f} | {t.status}"
             )
         await message.answer("\n".join(lines), parse_mode="HTML")

@@ -33,7 +33,7 @@ from core.okx_dex_client import OKXDexClient, USDT_MINT_SOLANA, USDT_DECIMALS
 from core.storage import get_session, Trade
 from core.price_feed import fetch_prices_usd
 from core.control_bot import notify_owner
-from core.formatting import format_price_usd
+from core.formatting import format_price_usd, display_token_symbol
 
 logger = logging.getLogger(__name__)
 
@@ -250,7 +250,7 @@ async def execute_partial_sell(
     prefix = "🧪 [DRY RUN] " if swap_result.dry_run else "✅ "
     status_note = "" if swap_result.success else " ⚠️ СВОП НЕ ВДАВСЯ"
     text = (
-        f"{prefix}📐 <b>{label}</b>: SELL {buy.token_symbol} "
+        f"{prefix}📐 <b>{label}</b>: SELL {display_token_symbol(buy.token_symbol, buy.contract_address)} "
         f"≈${amount_usd:.2f}{pct_note}{status_note}\n"
         f"tx: {swap_result.tx_hash}\n"
         f"Це {source_note}, {closing_note}."

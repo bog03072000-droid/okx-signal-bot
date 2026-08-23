@@ -20,8 +20,9 @@ from typing import Optional
 
 from sqlalchemy import func
 
-from core.storage import SignalLog, Trade
+from core.storage import SignalLog, Trade, TEST_TOKEN_SYMBOL
 from core.position_monitor import remaining_amount, POSITION_EPSILON
+from core.formatting import display_token_symbol
 
 PERIODS = {
     "day": ("День", dt.timedelta(days=1)),
@@ -45,8 +46,8 @@ class TradeStats:
     win_rate_pct: Optional[float] = None
     closed_sell_count: int = 0
     winning_sell_count: int = 0
-    best_trade: Optional[tuple] = None   # (pct, token_symbol)
-    worst_trade: Optional[tuple] = None  # (pct, token_symbol)
+    best_trade: Optional[tuple] = None   # (pct, token_symbol, contract_address)
+    worst_trade: Optional[tuple] = None  # (pct, token_symbol, contract_address)
     stop_loss_triggers: int = 0
     take_profit_triggers: int = 0
 
@@ -103,11 +104,17 @@ def _compute_signal_stats(session, period_start: dt.datetime) -> SignalStats:
 def _compute_trade_stats(session, period_start: dt.datetime, dry_run: bool) -> TradeStats:
     t = TradeStats()
 
+    # Trade.token_symbol.isnot(TEST_TOKEN_SYMBOL), а НЕ "!=" — token_symbol
+    # часто NULL (див. core/formatting.py:display_token_symbol), а звичайне
+    # "!=" в SQL повертає UNKNOWN (не True) для NULL-рядків, і вони мовчки
+    # випали б із запиту разом з тестовими. isnot() генерує SQL "IS NOT",
+    # який у SQLite коректно обробляє NULL (NULL IS NOT 'x' → true).
     opened_buys = session.query(Trade).filter(
         Trade.action == "buy",
         Trade.status == "confirmed",
         Trade.dry_run == dry_run,
         Trade.created_at >= period_start,
+        Trade.token_symbol.isnot(TEST_TOKEN_SYMBOL),
     ).all()
     t.opened_positions = len(opened_buys)
     for buy in opened_buys:
@@ -120,6 +127,7 @@ def _compute_trade_stats(session, period_start: dt.datetime, dry_run: bool) -> T
         Trade.status == "confirmed",
         Trade.dry_run == dry_run,
         Trade.created_at >= period_start,
+        Trade.token_symbol.isnot(TEST_TOKEN_SYMBOL),
     ).all()
 
     pnl_sells = [s for s in sells if s.pnl_usd is not None]
@@ -137,9 +145,9 @@ def _compute_trade_stats(session, period_start: dt.datetime, dry_run: bool) -> T
                 continue
             pct = s.pnl_usd / cost_basis * 100
             if best is None or pct > best[0]:
-                best = (pct, s.token_symbol)
+                best = (pct, s.token_symbol, s.contract_address)
             if worst is None or pct < worst[0]:
-                worst = (pct, s.token_symbol)
+                worst = (pct, s.token_symbol, s.contract_address)
         t.best_trade = best
         t.worst_trade = worst
 
@@ -162,9 +170,9 @@ def _format_trade_block(label: str, t: TradeStats) -> str:
         lines.append(f"• Сумарний PnL: ${t.total_pnl_usd:+.2f}")
         lines.append(f"• Win rate: {t.win_rate_pct:.0f}% ({t.winning_sell_count} з {t.closed_sell_count} закритих)")
         if t.best_trade:
-            lines.append(f"• Найкраща угода: {t.best_trade[0]:+.1f}% ({t.best_trade[1]})")
+            lines.append(f"• Найкраща угода: {t.best_trade[0]:+.1f}% ({display_token_symbol(t.best_trade[1], t.best_trade[2])})")
         if t.worst_trade:
-            lines.append(f"• Найгірша угода: {t.worst_trade[0]:+.1f}% ({t.worst_trade[1]})")
+            lines.append(f"• Найгірша угода: {t.worst_trade[0]:+.1f}% ({display_token_symbol(t.worst_trade[1], t.worst_trade[2])})")
     lines.append("")
     lines.append(f"{label} Спрацювання ladder:")
     lines.append(f"• Stop-loss спрацювань: {t.stop_loss_triggers}")

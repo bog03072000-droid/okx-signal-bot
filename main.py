@@ -20,6 +20,7 @@ from core.storage import init_db, get_session, SignalLog, Trade
 from core.wallet import get_wallet_balance, MOCK_WALLET_BALANCE_USD
 from core.control_bot import run_control_bot
 from core.price_feed import fetch_price_usd
+from core.formatting import display_token_symbol
 from core.position_monitor import position_monitor_loop, execute_partial_sell, remaining_amount, POSITION_EPSILON
 
 logging.basicConfig(
@@ -302,7 +303,7 @@ async def process_signal(client: TelegramClient, message_text: str):
             prefix = "🧪 [DRY RUN] " if swap_result.dry_run else "✅ "
             await notify(
                 client,
-                f"{prefix}BUY {parsed.token_symbol} на ${position_size_usd:.2f} | tx: {swap_result.tx_hash}",
+                f"{prefix}BUY {display_token_symbol(parsed.token_symbol, contract)} на ${position_size_usd:.2f} | tx: {swap_result.tx_hash}",
             )
 
             return parsed

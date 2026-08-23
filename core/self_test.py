@@ -34,7 +34,7 @@ from core.token_screener import TokenScreener
 from core.risk_manager import RiskManager
 from core.okx_dex_client import OKXDexClient, USDT_MINT_SOLANA, USDT_DECIMALS
 from core.wallet import get_wallet_balance, MOCK_WALLET_BALANCE_USD
-from core.storage import get_session, Trade
+from core.storage import get_session, Trade, TEST_TOKEN_SYMBOL
 from core.position_monitor import _check_position, _triggered_levels, remaining_amount
 from core.formatting import format_price_usd
 
@@ -75,7 +75,9 @@ TEST_SIGNAL_TEXT = "16k, дев очень жир JACCJHVy2QC96VNJK1iMrqYwMQPBbH
 # саме за цим полем відбувається і показ, і прибирання після тесту, а не
 # за адресою контракту.
 TEST_LADDER_CONTRACT = "So11111111111111111111111111111111111111112"  # Wrapped SOL mint
-TEST_LADDER_TOKEN_SYMBOL = "TEST_TOKEN"
+# Аліас на єдине джерело істини (core/storage.py) — див. коментар там щодо
+# того, чому саме storage.py, а не цей файл, визначає це значення.
+TEST_LADDER_TOKEN_SYMBOL = TEST_TOKEN_SYMBOL
 
 # Пауза між послідовними quote-викликами всередині run_ladder_test().
 # ПЕРЕВІРЕНО на реальному деплої (docker logs): без паузи 6 quote-запитів

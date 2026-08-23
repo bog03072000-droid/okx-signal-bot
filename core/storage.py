@@ -12,6 +12,19 @@ Base = declarative_base()
 engine = create_engine("sqlite:///data/bot.db", echo=False)
 SessionLocal = sessionmaker(bind=engine)
 
+# Позначка token_symbol для тимчасових Trade-рядків, які створює кнопка
+# "🧪 Тест" (core/self_test.py) для симуляції ladder TP/SL. Визначено тут
+# (а не в core/self_test.py чи core/position_monitor.py) навмисно — це
+# "листовий" модуль без залежностей від control_bot.py/position_monitor.py/
+# stats.py, тому його можуть безпечно імпортувати ВСІ вони без ризику
+# циклічного імпорту (control_bot.py зокрема НЕ може імпортувати
+# position_monitor.py на рівні модуля — обернений цикл вже є:
+# position_monitor -> control_bot). Кожен агрегований розрахунок у
+# core/stats.py і core/control_bot.py (/status, /balance, /positions,
+# /history, /статистика) МАЄ явно виключати рядки з цією позначкою — інакше
+# тестові "угоди" від кнопки потрапляють в реальну статистику.
+TEST_TOKEN_SYMBOL = "TEST_TOKEN"
+
 
 class SignalLog(Base):
     __tablename__ = "signal_log"

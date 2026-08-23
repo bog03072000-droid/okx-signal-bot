@@ -47,3 +47,19 @@ def format_price_usd(price: float) -> str:
     exponent = math.floor(math.log10(abs_price))
     decimals = -exponent + 3  # 4 значущі цифри, рахуючи від першої ненульової
     return f"{sign}${abs_price:.{decimals}f}"
+
+
+def display_token_symbol(token_symbol: "str | None", contract_address: "str | None" = None) -> str:
+    """
+    token_symbol часто None: SignalParser (core/signal_parser.py) повертає
+    його лише якщо тікер ЯВНО згаданий у тексті сигналу — канал зазвичай
+    пише лише капу+адресу, без тікера, тому None тут ОЧІКУВАНА поведінка
+    LLM, а не баг парсера. Замість "(None)" в /history, /статистика й
+    сповіщеннях — показуємо скорочену адресу контракту як читабельний
+    fallback (перші 4 + останні 4 символи).
+    """
+    if token_symbol:
+        return token_symbol
+    if contract_address and len(contract_address) > 10:
+        return f"{contract_address[:4]}...{contract_address[-4:]}"
+    return contract_address or "?"
