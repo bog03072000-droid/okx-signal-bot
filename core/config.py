@@ -69,6 +69,13 @@ class Settings:
     min_signal_confidence: float = _float("MIN_SIGNAL_CONFIDENCE", 0.7)
     default_stop_loss_pct: float = _float("DEFAULT_STOP_LOSS_PCT", 25.0)
     default_take_profit_pct: float = _float("DEFAULT_TAKE_PROFIT_PCT", 100.0)
+    # Максимальна допустима розбіжність між ціною, що викликала спрацювання
+    # ladder-рівня (DexScreener), і реальною ціною виконання свопу (OKX
+    # quote) — core/position_monitor.py:_check_position(). Не плутати з
+    # MAX_PRICE_IMPACT_PCT (core/risk_manager.py) — та перевірка стосується
+    # ручних buy/sell сигналів з каналу і власного price impact ОКРЕМОГО
+    # свопу, а не розбіжності МІЖ двома різними джерелами ціни.
+    max_price_divergence_pct: float = _float("MAX_PRICE_DIVERGENCE_PCT", 5.0)
 
 
 settings = Settings()
@@ -109,6 +116,7 @@ LIMIT_FIELDS: dict[str, tuple[str, type, str]] = {
     "MIN_SIGNAL_CONFIDENCE": ("min_signal_confidence", float, "(0-1)"),
     "DEFAULT_STOP_LOSS_PCT": ("default_stop_loss_pct", float, "%"),
     "DEFAULT_TAKE_PROFIT_PCT": ("default_take_profit_pct", float, "%"),
+    "MAX_PRICE_DIVERGENCE_PCT": ("max_price_divergence_pct", float, "%"),
 }
 
 

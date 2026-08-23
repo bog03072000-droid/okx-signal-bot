@@ -28,7 +28,7 @@ import json
 import logging
 import time
 
-from core.config import settings
+from core.config import settings, get_limit
 from core.okx_dex_client import OKXDexClient, USDT_MINT_SOLANA, USDT_DECIMALS
 from core.storage import get_session, Trade
 from core.price_feed import fetch_prices_usd
@@ -160,6 +160,80 @@ async def execute_partial_sell(
         logger.warning(f"{close_reason}: помилка quote для {buy.token_symbol}: {quote.error}")
         return False
 
+    # amount_usd — з quote.to_amount (реальна кількість USDT за курсом свопу),
+    # а не sell_raw_amount * current_price (DexScreener-ціна) — курс свопу і
+    # ринкова ціна DexScreener можуть трохи розходитись (price impact, спред).
+    # Рахуємо ДО execute_swap(), бо нижче він же потрібен для перевірки
+    # розбіжності цін (MAX_PRICE_DIVERGENCE_PCT) — перед виконанням свопу,
+    # а не після.
+    try:
+        amount_usd = float(quote.to_amount) / (10 ** USDT_DECIMALS) if quote.to_amount else 0.0
+    except (TypeError, ValueError):
+        amount_usd = 0.0
+
+    # --- Перевірка розбіжності: DexScreener-ціна тригера vs реальна ціна OKX ---
+    # Стосується ЛИШЕ автоматичних спрацювань ladder TP/SL (close_reason з
+    # префіксом stop_loss_/take_profit_) — прямі sell-сигнали з каналу і
+    # reply-sell евристики цю перевірку НЕ проходять (у них немає "тригера
+    # за іншою ціною", який можна було б звірити — юзер сам вирішив продати).
+    # Це ОКРЕМА перевірка від check_price_impact (core/risk_manager.py) —
+    # та стосується власного price impact ОДНОГО свопу, а не розбіжності
+    # МІЖ двома різними джерелами ціни (DexScreener проти OKX).
+    #
+    # Через відсутність decimals токена в цій системі (token_amount/
+    # sell_raw_amount — сирі, найменші одиниці; entry_price/current_price —
+    # USD за ЦІЛИЙ токен з DexScreener) пряме порівняння "ціна_OKX $ проти
+    # ціна_DexScreener $" неможливе без знання decimals. Замість цього
+    # порівнюємо RATIO: "% зміни ціни, який неявно випливає з реального
+    # котирування OKX" (окремо для собівартості на raw-юніт, той самий
+    # decimals-незалежний підхід, що вже в pnl_usd нижче) проти "% зміни
+    # ціни, яку показав DexScreener і яка викликала тригер" (pct_change).
+    # Математично еквівалентно порівнянню абсолютних цін, бо обидві сторони
+    # виражені відносно ОДНІЄЇ й тієї самої точки відліку (вхід у позицію).
+    # force_dry_run виключено з цієї перевірки: це ЛИШЕ кнопка "🧪 Тест"
+    # (core/self_test.py) — вона свідомо використовує синтетичні
+    # entry_price/amount_usd (напр. $10 за 1,000,000 raw-юнітів) проти
+    # РЕАЛЬНОГО OKX quote на справжній Wrapped SOL, тож "очікувана" ціна за
+    # цими фейковими числами не має нічого спільного з реальним котируванням
+    # — розбіжність завжди була б величезною і блокувала б КОЖЕН рівень
+    # тесту. Оскільки force_dry_run=True вже гарантує, що жодного реального
+    # свопу не буде (execute_swap завжди повертає симуляцію), захищати тут
+    # нічого — перевірка існує для РЕАЛЬНИХ грошей, а не для тесту логіки
+    # порогів.
+    is_ladder_trigger = close_reason.startswith("stop_loss_") or close_reason.startswith("take_profit_")
+    if (
+        is_ladder_trigger and not force_dry_run
+        and current_price is not None and buy.entry_price and buy.amount_usd and buy.token_amount
+    ):
+        pct_change_dexscreener = (current_price - buy.entry_price) / buy.entry_price
+        cost_per_raw_unit = buy.amount_usd / buy.token_amount
+        expected_price_per_raw_unit = cost_per_raw_unit * (1 + pct_change_dexscreener)
+        actual_price_per_raw_unit = amount_usd / sell_raw_amount
+        if expected_price_per_raw_unit != 0:
+            divergence_pct = abs(
+                actual_price_per_raw_unit - expected_price_per_raw_unit
+            ) / abs(expected_price_per_raw_unit) * 100
+            max_divergence_pct = get_limit("MAX_PRICE_DIVERGENCE_PCT")
+            if divergence_pct > max_divergence_pct:
+                logger.warning(
+                    f"{close_reason}: розбіжність цін {divergence_pct:.1f}% (DexScreener-тригер "
+                    f"vs реальний OKX quote) перевищує ліміт {max_divergence_pct}% для "
+                    f"{buy.token_symbol} — своп ПРИЗУПИНЕНО на цьому циклі, рівень НЕ позначено "
+                    f"спрацьованим, перевірка повториться наступного циклу."
+                )
+                await notify_owner(
+                    f"⚠️ Розбіжність цін {divergence_pct:.1f}% перевищує ліміт "
+                    f"{max_divergence_pct}% для {display_token_symbol(buy.token_symbol, buy.contract_address)} "
+                    f"— своп призупинено, рівень {close_reason} буде перевірено повторно "
+                    f"наступного циклу."
+                )
+                # TODO: якщо розбіжність постійно перевищує поріг кілька циклів
+                # поспіль (напр. 5+) для однієї й тієї ж позиції — варто окремо
+                # сповістити "позиція застрягла, можливо потрібне ручне
+                # втручання" (лічильник послідовних divergence-пропусків на
+                # buy.id тут не ведеться, свідомо залишено на майбутнє рішення).
+                return False
+
     swap_result = await asyncio.to_thread(
         dex.execute_swap,
         buy.contract_address, USDT_MINT_SOLANA, amount_raw,
@@ -168,14 +242,6 @@ async def execute_partial_sell(
         chain_id="501",
         force_dry_run=force_dry_run,
     )
-
-    # amount_usd — з quote.to_amount (реальна кількість USDT за курсом свопу),
-    # а не sell_raw_amount * current_price (DexScreener-ціна) — курс свопу і
-    # ринкова ціна DexScreener можуть трохи розходитись (price impact, спред).
-    try:
-        amount_usd = float(quote.to_amount) / (10 ** USDT_DECIMALS) if quote.to_amount else 0.0
-    except (TypeError, ValueError):
-        amount_usd = 0.0
 
     # --- PnL для ЦІЄЇ конкретної частки, що продається ---
     # cost_per_raw_unit = скільки USD коштував ОДИН raw-юніт токена на вході
