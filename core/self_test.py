@@ -36,6 +36,7 @@ from core.okx_dex_client import OKXDexClient, USDT_MINT_SOLANA, USDT_DECIMALS
 from core.wallet import get_wallet_balance, MOCK_WALLET_BALANCE_USD
 from core.storage import get_session, Trade
 from core.position_monitor import _check_position, _triggered_levels, remaining_amount
+from core.formatting import format_price_usd
 
 logger = logging.getLogger(__name__)
 
@@ -296,7 +297,7 @@ async def run_ladder_test() -> list[str]:
         # QUOTE_CALL_DELAY_SECONDS вище (без неї — 429 від OKX).
         await asyncio.sleep(QUOTE_CALL_DELAY_SECONDS)
         price_sl10 = entry_price * 0.90
-        lines.append(f"Сценарій SL: вхід ${entry_price:g} → ціна ${price_sl10:g} (-10%)")
+        lines.append(f"Сценарій SL: вхід {format_price_usd(entry_price)} → ціна {format_price_usd(price_sl10)} (-10%)")
         # force_dry_run=True — ЛІТЕРАЛ, той самий сенс, що й у run_buy_signal_test().
         await _check_position(session, buy_sl, price_sl10, force_dry_run=True)
         remaining = remaining_amount(session, buy_sl)
@@ -308,7 +309,7 @@ async def run_ladder_test() -> list[str]:
 
         await asyncio.sleep(QUOTE_CALL_DELAY_SECONDS)
         price_sl20 = entry_price * 0.80
-        lines.append(f"Сценарій SL: ціна впала до ${price_sl20:g} (-20% від входу)")
+        lines.append(f"Сценарій SL: ціна впала до {format_price_usd(price_sl20)} (-20% від входу)")
         await _check_position(session, buy_sl, price_sl20, force_dry_run=True)
         remaining = remaining_amount(session, buy_sl)
         if "stop_loss_-20pct" in _triggered_levels(buy_sl) and remaining < 1.0:
@@ -339,7 +340,7 @@ async def run_ladder_test() -> list[str]:
         for pct, level_code, label, expect_desc in tp_steps:
             await asyncio.sleep(QUOTE_CALL_DELAY_SECONDS)
             price = entry_price * (1 + pct)
-            lines.append(f"Сценарій TP: вхід ${entry_price:g} → ціна ${price:g} ({label})")
+            lines.append(f"Сценарій TP: вхід {format_price_usd(entry_price)} → ціна {format_price_usd(price)} ({label})")
             await _check_position(session, buy_tp, price, force_dry_run=True)
             remaining = remaining_amount(session, buy_tp)
             if level_code in _triggered_levels(buy_tp):

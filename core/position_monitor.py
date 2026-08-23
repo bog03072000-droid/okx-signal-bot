@@ -33,6 +33,7 @@ from core.okx_dex_client import OKXDexClient, USDT_MINT_SOLANA, USDT_DECIMALS
 from core.storage import get_session, Trade
 from core.price_feed import fetch_prices_usd
 from core.control_bot import notify_owner
+from core.formatting import format_price_usd
 
 logger = logging.getLogger(__name__)
 
@@ -232,10 +233,19 @@ async def execute_partial_sell(
         source_note = "прямий sell-сигнал з каналу (адреса контракту вказана явно в тексті)"
         closing_note = "<b>сигнал з каналу</b>"
 
+    # format_price_usd() — ЛИШЕ для показу в тексті сповіщення; сам pct
+    # тут і далі (передача в _mark_triggered/порогові порівняння) завжди
+    # рахується з "сирих" float entry_price/current_price, а не з цього
+    # форматованого рядка. Без format_price_usd() ціни memecoin з 5-10
+    # нулями після коми (напр. $0.0000001234) в наївному f"${p:.2f}" завжди
+    # показували б "$0.00" — усі значущі цифри губились би.
     pct_note = ""
     if current_price is not None and buy.entry_price:
         pct = (current_price - buy.entry_price) / buy.entry_price * 100
-        pct_note = f" (ціна {pct:+.1f}% від входу)"
+        pct_note = (
+            f" ({format_price_usd(buy.entry_price)} → {format_price_usd(current_price)}, "
+            f"{pct:+.1f}% від входу)"
+        )
 
     prefix = "🧪 [DRY RUN] " if swap_result.dry_run else "✅ "
     status_note = "" if swap_result.success else " ⚠️ СВОП НЕ ВДАВСЯ"
