@@ -96,6 +96,10 @@ class IsAdmin(BaseFilter):
 is_allowed = IsAllowed()
 is_admin = IsAdmin()
 
+# П.2 аудиту: скільки хвилин Trade зі status="pending" вважається "застряглим"
+# для лічильника в /status — див. cmd_status().
+STUCK_PENDING_THRESHOLD_MINUTES = 5
+
 
 # --- Reply-клавіатури: адмін бачить повний набір, user — лише перегляд ---
 USER_KEYBOARD = ReplyKeyboardMarkup(
@@ -265,6 +269,19 @@ async def cmd_status(message: Message):
         mode = "🧪 DRY RUN (без реальних угод)" if settings.dry_run else "🔴 LIVE (реальні гроші)"
         pause_state = "⏸️ НА ПАУЗІ (/start щоб відновити)" if runtime_state.is_paused() else "▶️ активна"
 
+        # Застряглий pending — Trade зі status="pending" (П.2, core/main.py і
+        # core/position_monitor.py), який досі НЕ оновився до confirmed/failed
+        # довше STUCK_PENDING_THRESHOLD_MINUTES. У штатному режимі pending
+        # живе частки секунди (між створенням рядка і завершенням свопу) —
+        # якщо він старший за поріг, це ознака, що процес впав саме в цьому
+        # вікні (реальна транзакція могла піти в мережу, а результат не
+        # записався) і потрібне ручне втручання.
+        stuck_pending_before = dt.datetime.utcnow() - dt.timedelta(minutes=STUCK_PENDING_THRESHOLD_MINUTES)
+        stuck_pending_count = session.query(Trade).filter(
+            Trade.status == "pending", Trade.created_at < stuck_pending_before
+        ).count()
+        pending_line = f"\n⚠️ Застряглих pending-угод: {stuck_pending_count}" if stuck_pending_count > 0 else ""
+
         await message.answer(
             "📊 <b>Статус бота</b>\n"
             f"Режим: {mode}\n"
@@ -272,7 +289,8 @@ async def cmd_status(message: Message):
             f"Сигналів сьогодні: {signals_today}\n"
             f"Виконано угод: {executed_today}\n"
             f"Відхилено: {rejected_today}\n"
-            f"Відхилено через непідтримувану мережу: {unsupported_chain_today}",
+            f"Відхилено через непідтримувану мережу: {unsupported_chain_today}"
+            f"{pending_line}",
             parse_mode="HTML",
         )
     finally:

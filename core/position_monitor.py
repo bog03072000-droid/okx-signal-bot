@@ -234,6 +234,41 @@ async def execute_partial_sell(
                 # buy.id тут не ведеться, свідомо залишено на майбутнє рішення).
                 return False
 
+    # --- PnL для ЦІЄЇ конкретної частки, що продається ---
+    # cost_per_raw_unit = скільки USD коштував ОДИН raw-юніт токена на вході
+    # (buy.amount_usd / buy.token_amount) — decimals довільного токена
+    # скорочуються в цьому співвідношенні, тому не треба їх окремо знати.
+    # pnl = виручка за цю частку - собівартість цієї ж частки. НЕ враховує
+    # комісії мережі/сліпедж понад те, що вже відображено в amount_usd з
+    # реального quote — окремих даних про комісії система не збирає.
+    # Рахуємо ДО execute_swap() — amount_usd (з quote) вже відомий, і pnl_usd
+    # можна одразу покласти в pending-рядок нижче.
+    pnl_usd = None
+    if buy.amount_usd is not None and buy.token_amount:
+        cost_basis_usd = (buy.amount_usd / buy.token_amount) * sell_raw_amount
+        pnl_usd = amount_usd - cost_basis_usd
+
+    # --- Pending-запис ДО свопу (П.2) ---
+    # Якщо процес впаде між відправкою транзакції і записом результату —
+    # без цього кроку бот "загубив" би позицію (гроші реально рухались, а в
+    # БД жодного сліду). status="pending" рядок хоча б лишається видимим і
+    # /status показує його як "застряглий" після 5хв.
+    sell_trade = Trade(
+        action="sell",
+        token_symbol=buy.token_symbol,
+        contract_address=buy.contract_address,
+        chain=buy.chain,
+        amount_usd=amount_usd,
+        pnl_usd=pnl_usd,
+        token_amount=sell_raw_amount,
+        dry_run=force_dry_run or settings.dry_run,
+        status="pending",
+        parent_trade_id=buy.id,
+        close_reason=close_reason,
+    )
+    session.add(sell_trade)
+    session.commit()
+
     swap_result = await asyncio.to_thread(
         dex.execute_swap,
         buy.contract_address, USDT_MINT_SOLANA, amount_raw,
@@ -243,32 +278,12 @@ async def execute_partial_sell(
         force_dry_run=force_dry_run,
     )
 
-    # --- PnL для ЦІЄЇ конкретної частки, що продається ---
-    # cost_per_raw_unit = скільки USD коштував ОДИН raw-юніт токена на вході
-    # (buy.amount_usd / buy.token_amount) — decimals довільного токена
-    # скорочуються в цьому співвідношенні, тому не треба їх окремо знати.
-    # pnl = виручка за цю частку - собівартість цієї ж частки. НЕ враховує
-    # комісії мережі/сліпедж понад те, що вже відображено в amount_usd з
-    # реального quote — окремих даних про комісії система не збирає.
-    pnl_usd = None
-    if buy.amount_usd is not None and buy.token_amount:
-        cost_basis_usd = (buy.amount_usd / buy.token_amount) * sell_raw_amount
-        pnl_usd = amount_usd - cost_basis_usd
-
-    sell_trade = Trade(
-        action="sell",
-        token_symbol=buy.token_symbol,
-        contract_address=buy.contract_address,
-        chain=buy.chain,
-        amount_usd=amount_usd,
-        pnl_usd=pnl_usd,
-        token_amount=sell_raw_amount,
-        tx_hash=swap_result.tx_hash,
-        dry_run=swap_result.dry_run,
-        status="confirmed" if swap_result.success else "failed",
-        parent_trade_id=buy.id,
-        close_reason=close_reason,
-    )
+    # --- Оновлюємо ТОЙ САМИЙ pending-рядок (не створюємо новий) ---
+    sell_trade.tx_hash = swap_result.tx_hash
+    sell_trade.dry_run = swap_result.dry_run
+    sell_trade.status = "confirmed" if swap_result.success else "failed"
+    if not swap_result.success:
+        sell_trade.failure_reason = swap_result.error
     session.add(sell_trade)
 
     if swap_result.success:

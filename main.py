@@ -37,6 +37,13 @@ dex = OKXDexClient()
 HEARTBEAT_FILE = "data/heartbeat.txt"
 HEARTBEAT_INTERVAL_SECONDS = 30
 
+# Короткоживучий lock лише навколо "перевір MAX_OPEN_POSITIONS → створи
+# pending buy-рядок" (П.3) — НЕ навколо всього process_signal(). Без нього
+# два сигнали, що паралельно пройшли б асинхронні мережеві виклики вище
+# (asyncio.to_thread звільнив реальні await-точки, де раніше їх не було),
+# могли б обидва побачити "1 вільний слот" одночасно і обидва купити.
+OPEN_POSITIONS_LOCK = asyncio.Lock()
+
 # Слова, що можуть означати продаж у reply-повідомленні без адреси контракту
 # (канал згадує продажі саме так — див. core/signal_parser.py REPLY_SELL_SYSTEM_PROMPT).
 # Це лише швидкий Python-фільтр ДО виклику LLM (щоб не палити токени Claude
@@ -147,6 +154,12 @@ async def process_signal(client: TelegramClient, message_text: str):
             return parsed
 
         # --- Ліміт відкритих позицій (тільки для buy) ---
+        # Це ШВИДКИЙ, НЕатомарний попередній фільтр — рятує від зайвого
+        # запиту балансу/скринінгу токена, коли ліміт і так вже вичерпано.
+        # АВТОРИТЕТНА, атомарна (під OPEN_POSITIONS_LOCK) перевірка — нижче,
+        # безпосередньо перед резервуванням слота pending-рядком (див.
+        # коментар біля OPEN_POSITIONS_LOCK) — САМЕ вона захищає від race
+        # condition, коли 2 сигнали проходять цей ранній фільтр одночасно.
         if parsed.action == "buy":
             pos_check = risk.check_open_positions_limit()
             if not pos_check.allowed:
@@ -157,7 +170,9 @@ async def process_signal(client: TelegramClient, message_text: str):
                 return parsed
 
         # --- Баланс гаманця (USDT — торговий капітал, SOL — резерв на газ) ---
-        wallet_balance = get_wallet_balance()
+        # asyncio.to_thread — див. коментар біля виклику get_quote() нижче:
+        # синхронний Solana RPC-виклик, не блокуємо ним спільний event loop.
+        wallet_balance = await asyncio.to_thread(get_wallet_balance)
 
         if not settings.dry_run and wallet_balance.usdt_balance is None:
             # У LIVE-режимі свідомо НЕ підставляємо MOCK_WALLET_BALANCE_USD, якщо
@@ -188,8 +203,10 @@ async def process_signal(client: TelegramClient, message_text: str):
             return parsed
 
         # --- Токен-скринінг (тільки для buy — продавати наявне можна завжди) ---
+        # asyncio.to_thread — той самий синхронний httpx.Client всередині
+        # TokenScreener.screen(), не блокуємо ним спільний event loop.
         if parsed.action == "buy":
-            screening = screener.screen(contract, parsed.chain or settings.chain)
+            screening = await asyncio.to_thread(screener.screen, contract, parsed.chain or settings.chain)
             if not screening.passed:
                 reason = "Токен не пройшов скринінг: " + "; ".join(screening.reasons_failed)
                 log_entry.rejection_reason = reason
@@ -233,7 +250,16 @@ async def process_signal(client: TelegramClient, message_text: str):
                 session.commit()
                 return parsed
 
-            quote = dex.get_quote(from_addr, to_addr, amount_raw)
+            # Синхронний HTTP-виклик до OKX винесений в окремий потік через
+            # asyncio.to_thread, щоб НЕ блокувати спільний event loop
+            # (control-бот і ladder-монітор position_monitor_loop() сидять в
+            # ньому ж) — той самий патерн, що вже є в
+            # core/position_monitor.py:execute_partial_sell() (див. коментар там).
+            # Раніше цей виклик був синхронним напряму — на час запиту до OKX
+            # (сотні мс — секунди) весь control-бот і ladder-монітор зависали.
+            # Той самий патерн застосовано нижче й до execute_swap(), і вище до
+            # get_wallet_balance()/screener.screen()/fetch_price_usd().
+            quote = await asyncio.to_thread(dex.get_quote, from_addr, to_addr, amount_raw)
             if not quote.success:
                 log_entry.rejection_reason = f"Помилка отримання quote: {quote.error}"
                 session.add(log_entry)
@@ -249,24 +275,57 @@ async def process_signal(client: TelegramClient, message_text: str):
                 await notify(client, f"⚠️ Сигнал відхилено: {impact_check.reason}")
                 return parsed
 
+            # --- Атомарне резервування слота МІСЦЯ (не просто "перевірка") ---
+            # OPEN_POSITIONS_LOCK тримається КОРОТКО, лише навколо "перевір
+            # ліміт → створи pending-рядок" — не навколо всього process_signal(),
+            # інакше знову заблокуємо паралелізм між сигналами, якого щойно
+            # досягли asyncio.to_thread вище. Сам pending-рядок (не просто
+            # булевий прапорець) і Є резервуванням: check_open_positions_limit()
+            # (core/risk_manager.py) рахує buy зі status IN ("confirmed",
+            # "pending") — тому другий паралельний сигнал, що зайде в лок
+            # одразу після першого, побачить уже зайнятий слот.
+            async with OPEN_POSITIONS_LOCK:
+                pos_check = risk.check_open_positions_limit()
+                if not pos_check.allowed:
+                    log_entry.rejection_reason = pos_check.reason
+                    session.add(log_entry)
+                    session.commit()
+                    await notify(client, f"⚠️ Сигнал відхилено: {pos_check.reason}")
+                    return parsed
+
+                # --- Pending-запис ДО свопу (П.2) ---
+                # Якщо процес впаде між відправкою транзакції і записом
+                # результату — без цього кроку бот "загубив" би позицію: гроші
+                # реально рухались, а в БД про це взагалі жодного сліду. Тепер
+                # хоча б лишається status="pending" рядок, який /status показує
+                # як "застряглий" після 5хв — сигнал власнику розібратись вручну.
+                trade = Trade(
+                    action="buy",
+                    token_symbol=parsed.token_symbol,
+                    contract_address=contract,
+                    chain=parsed.chain or settings.chain,
+                    amount_usd=position_size_usd,
+                    dry_run=settings.dry_run,
+                    status="pending",
+                )
+                session.add(trade)
+                session.commit()
+
             # --- Виконання (або dry-run симуляція) ---
-            swap_result = dex.execute_swap(
+            swap_result = await asyncio.to_thread(
+                dex.execute_swap,
                 from_addr, to_addr, amount_raw,
                 wallet_address="<буде підставлено з гаманця>",
                 slippage_pct=settings.max_slippage_pct,
                 chain_id="501",
             )
 
-            trade = Trade(
-                action="buy",
-                token_symbol=parsed.token_symbol,
-                contract_address=contract,
-                chain=parsed.chain or settings.chain,
-                amount_usd=position_size_usd,
-                tx_hash=swap_result.tx_hash,
-                dry_run=swap_result.dry_run,
-                status="confirmed" if swap_result.success else "failed",
-            )
+            # --- Оновлюємо ТОЙ САМИЙ pending-рядок (не створюємо новий) ---
+            trade.tx_hash = swap_result.tx_hash
+            trade.dry_run = swap_result.dry_run
+            trade.status = "confirmed" if swap_result.success else "failed"
+            if not swap_result.success:
+                trade.failure_reason = swap_result.error
 
             if swap_result.success:
                 # token_amount — RAW (найменші одиниці) отриманого токена, напряму
@@ -285,7 +344,9 @@ async def process_signal(client: TelegramClient, message_text: str):
                 # core/position_monitor.py._get_open_positions() свідомо пропускає
                 # такі позиції — жодного автоматичного SL/TP на них не буде,
                 # лишається тільки ручний /positions.
-                trade.entry_price = fetch_price_usd(contract, parsed.chain or settings.chain)
+                trade.entry_price = await asyncio.to_thread(
+                    fetch_price_usd, contract, parsed.chain or settings.chain
+                )
                 if trade.entry_price is None:
                     logger.warning(
                         f"Не вдалось отримати entry_price для {parsed.token_symbol} — "
@@ -337,7 +398,7 @@ async def process_signal(client: TelegramClient, message_text: str):
                 return parsed
 
             sell_amount = remaining_amount(session, buy)
-            current_price = fetch_price_usd(contract, parsed.chain or settings.chain)
+            current_price = await asyncio.to_thread(fetch_price_usd, contract, parsed.chain or settings.chain)
 
             # execute_partial_sell сама пише Trade (з pnl_usd) і сповіщає власника
             # через control-бота — окремий notify() тут не потрібен.
@@ -413,7 +474,9 @@ async def process_reply_sell(client: TelegramClient, event):
 
         remaining = remaining_amount(session, buy)
         sell_amount = remaining * fraction
-        current_price = fetch_price_usd(original_parsed.contract_address, original_parsed.chain or settings.chain)
+        current_price = await asyncio.to_thread(
+            fetch_price_usd, original_parsed.contract_address, original_parsed.chain or settings.chain
+        )
         close_reason = f"reply_sell_heuristic_{int(round(fraction * 100))}pct"
 
         logger.info(

@@ -64,7 +64,12 @@ class TokenScreener:
                         f"Токен занадто новий: {age_hours:.1f}год "
                         f"(мінімум {min_age}год)"
                     )
-        except httpx.HTTPError as e:
+        except (httpx.HTTPError, ValueError) as e:
+            # ValueError покриває json.JSONDecodeError — resp.json() на
+            # валідній HTTP-відповіді (200) з поламаним/неочікуваним тілом
+            # кидає його ОКРЕМО від мережевих помилок httpx.HTTPError, і
+            # раніше тут нічим не ловився — screen() падав неспійманим
+            # винятком замість чіткого reasons_failed.
             reasons.append(f"Помилка запиту до DexScreener: {e}")
 
         # --- 2. GoPlus Security: honeypot / mint authority / owner privileges ---
@@ -81,7 +86,11 @@ class TokenScreener:
                 if token_data.get("freezable", {}).get("status") == "1":
                     is_honeypot = True
                     reasons.append("Токен має freeze authority (можуть заморозити твої токени)")
-            except httpx.HTTPError as e:
+            except (httpx.HTTPError, ValueError) as e:
+                # ValueError/JSONDecodeError — той самий випадок, що й вище для
+                # DexScreener, але тут (як і раніше для мережевих помилок)
+                # НЕ провалюємо весь скринінг — GoPlus лише додаткова
+                # перевірка, її недоступність не має блокувати угоду.
                 logger.warning(f"GoPlus API недоступний: {e} — пропускаємо цю перевірку")
         # Для ETH/BSC аналогічно є GoPlus endpoint /api/v1/token_security/{chain_id}
         # додати за потреби при розширенні на ці мережі

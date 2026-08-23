@@ -78,6 +78,11 @@ class Trade(Base):
     # buy-позиції (заповнюється тільки на buy-рядку). Захист від повторного
     # спрацювання того самого рівня на наступній перевірці.
     triggered_levels = Column(Text, nullable=True, default="[]")
+    # failure_reason — заповнюється лише коли status="failed": причина, з якою
+    # execute_swap() повернув success=False (напр. "quote застарів", помилка
+    # OKX) — БЕЗ цього при status="failed" не було звідки дізнатись, чому,
+    # окрім логів процесу (які на сервері ротуються/зникають).
+    failure_reason = Column(Text, nullable=True)
 
 
 def _migrate_trades_table():
@@ -102,6 +107,7 @@ def _migrate_trades_table():
         "parent_trade_id": "INTEGER",
         "close_reason": "VARCHAR",
         "triggered_levels": "TEXT",
+        "failure_reason": "TEXT",
     }
     with engine.begin() as conn:
         for col_name, col_type in new_columns.items():
