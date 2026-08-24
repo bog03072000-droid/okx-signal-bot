@@ -77,7 +77,13 @@ def resolve_contract_address(parsed) -> str | None:
 async def process_signal(client: TelegramClient, message_text: str):
     session = get_session()
     try:
-        parsed = parser.parse(message_text)
+        # asyncio.to_thread — той самий патерн, що й для OKX/DexScreener/Solana
+        # RPC нижче: SignalParser.parse() — синхронний виклик Claude API
+        # (anthropic SDK), типово 1-3с. Без to_thread цей виклик блокував би
+        # спільний event loop (control-бот, ladder-монітор) щоразу, коли в
+        # каналі з'являється НОВЕ повідомлення — а це відбувається частіше й
+        # менш передбачувано, ніж власні мережеві виклики бота.
+        parsed = await asyncio.to_thread(parser.parse, message_text)
 
         log_entry = SignalLog(
             raw_text=parsed.raw_text,
@@ -439,12 +445,14 @@ async def process_reply_sell(client: TelegramClient, event):
     if not original_msg or not original_msg.message:
         return
 
-    original_parsed = parser.parse(original_msg.message)
+    # asyncio.to_thread — див. коментар в process_signal() вище: синхронний
+    # виклик Claude API, не блокуємо ним спільний event loop.
+    original_parsed = await asyncio.to_thread(parser.parse, original_msg.message)
     if not original_parsed.contract_address:
         logger.info("Reply-sell: оригінал не містить адреси контракту — пропускаємо")
         return
 
-    reply_result = parser.parse_reply_sell(reply_text, original_msg.message)
+    reply_result = await asyncio.to_thread(parser.parse_reply_sell, reply_text, original_msg.message)
     if not reply_result["is_sell_signal"] or reply_result["confidence"] < settings.min_signal_confidence:
         logger.info(
             f"Reply-sell: LLM не підтвердив sell для {original_parsed.token_symbol} "

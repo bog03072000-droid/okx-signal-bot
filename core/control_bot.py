@@ -29,6 +29,7 @@ Telegram control-бот керування (Bot API, aiogram) — окремий
 текстових команд: /status, /setlimit НАЗВА значення тощо продовжують
 працювати як і раніше, незалежно від кнопок.
 """
+import asyncio
 import datetime as dt
 import logging
 
@@ -306,7 +307,11 @@ async def cmd_balance(message: Message):
     finally:
         session.close()
 
-    balance = get_wallet_balance()
+    # asyncio.to_thread — get_wallet_balance() робить синхронний Solana RPC-
+    # виклик; без цього /balance блокував би control-бота (та спільний event
+    # loop із ladder-монітором) на час запиту, той самий патерн, що вже
+    # застосовано для мережевих викликів у main.py.
+    balance = await asyncio.to_thread(get_wallet_balance)
     usdt_line = f"${balance.usdt_balance:,.2f}" if balance.usdt_balance is not None else "н/д"
     sol_line = f"{balance.sol_balance:.4f} SOL" if balance.sol_balance is not None else "н/д"
     gas_marker = " ⚠️ МАЛО НА ГАЗ" if balance.low_gas_warning else ""

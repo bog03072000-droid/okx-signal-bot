@@ -73,6 +73,31 @@ _price_cache: dict[str, float] = {}
 _price_cache_updated_at: float = 0.0
 _last_checked_price: dict[int, float] = {}  # buy.id -> остання оброблена ціна
 
+# П.1 (повторний аудит): execute_partial_sell() викликається з ТРЬОХ незалежних
+# джерел (ladder _check_position нижче, прямий sell-сигнал і reply-sell — обидва
+# в main.py) без синхронізації — два одночасні виклики на ТУ САМУ позицію могли
+# прочитати однаковий remaining_amount() і обидва спробувати продати весь
+# залишок. Lock ПЕР-ПОЗИЦІЯ (ключ — buy.id), а не один спільний lock на все:
+# інакше продаж однієї позиції зайве блокував би перевірку/продаж УСІХ інших.
+#
+# Очищення: свідомо НЕ видаляємо записи зі словника навіть коли позиція
+# повністю закрита. Видалення було б racy (інша задача могла б уже отримати
+# посилання на СТАРИЙ Lock-об'єкт з _position_locks.get(), поки ми його
+# видаляємо і хтось третій створює НОВИЙ Lock під тим самим ключем — тоді два
+# "паралельних" викликачі тримали б РІЗНІ lock-об'єкти і взаємно не бачили б
+# одне одного, що зводить нанівець весь сенс лока). Пам'ять на це тривіальна:
+# один asyncio.Lock() — це лише кілька байт, а buy.id — цілі позиції, яких
+# для соло-бота реалістично сотні-тисячі за роки роботи, не мільйони.
+_position_locks: dict[int, asyncio.Lock] = {}
+
+
+def _lock_for(buy_id: int) -> asyncio.Lock:
+    lock = _position_locks.get(buy_id)
+    if lock is None:
+        lock = asyncio.Lock()
+        _position_locks[buy_id] = lock
+    return lock
+
 
 def _get_open_positions(session) -> list:
     """
@@ -147,155 +172,182 @@ async def execute_partial_sell(
     if sell_raw_amount <= 0:
         return False
 
-    amount_raw = str(int(sell_raw_amount))
+    # П.1 (повторний аудит): весь блок "перевір залишок → визнач суму
+    # продажу → pending-рядок → своп → фінальний коміт" — під локом НА ЦЮ
+    # КОНКРЕТНУ ПОЗИЦІЮ (buy.id). Тримаємо лок аж до фінального
+    # session.commit() (а не лише навколо читання/запису pending-рядка):
+    # remaining_amount() рахує лише status=="confirmed" sell-рядки, тому
+    # ЧУЖИЙ pending sell (ще не підтверджений) для неї "невидимий" — якби
+    # лок звільнявся раніше, другий паралельний виклик міг би прочитати
+    # remaining_amount(), що ще не враховує перший (не підтверджений) sell,
+    # і знову спробувати продати той самий залишок.
+    async with _lock_for(buy.id):
+        # Перевіряємо залишок ЗАНОВО під локом — інший виклик (ladder/прямий
+        # sell-сигнал/reply-sell) міг продати частину чи все, поки цей чекав
+        # на лок. Якщо вже нічого продавати — тихо виходимо, це НЕ помилка.
+        fresh_remaining = remaining_amount(session, buy)
+        if fresh_remaining <= POSITION_EPSILON:
+            logger.info(
+                f"{close_reason}: позиція {buy.token_symbol} вже повністю продана іншим "
+                f"паралельним викликом (поки чекали на lock) — пропускаємо"
+            )
+            return False
+        # Клемпимо запитану суму до РЕАЛЬНОГО поточного залишку — викликач
+        # (ladder/main.py) рахував sell_raw_amount ДО того, як зайняв лок,
+        # тож міг орієнтуватись на вже застарілий remaining_amount().
+        sell_raw_amount = min(sell_raw_amount, fresh_remaining)
 
-    # Синхронні HTTP-виклики (get_quote/execute_swap — той самий шлях, що й
-    # для sell-сигналів з каналу в main.py) винесені в окремий потік через
-    # asyncio.to_thread, щоб НЕ блокувати спільний event loop (Telethon
-    # listener + control-бот сидять в ньому ж). На відміну від main.py, де
-    # блокуючий виклик стається раз на сигнал, тут цикл раз/2с — тому
-    # блокування тут відчутніше для чутливості control-бота на команди.
-    quote = await asyncio.to_thread(dex.get_quote, buy.contract_address, USDT_MINT_SOLANA, amount_raw)
-    if not quote.success:
-        logger.warning(f"{close_reason}: помилка quote для {buy.token_symbol}: {quote.error}")
-        return False
+        amount_raw = str(int(sell_raw_amount))
 
-    # amount_usd — з quote.to_amount (реальна кількість USDT за курсом свопу),
-    # а не sell_raw_amount * current_price (DexScreener-ціна) — курс свопу і
-    # ринкова ціна DexScreener можуть трохи розходитись (price impact, спред).
-    # Рахуємо ДО execute_swap(), бо нижче він же потрібен для перевірки
-    # розбіжності цін (MAX_PRICE_DIVERGENCE_PCT) — перед виконанням свопу,
-    # а не після.
-    try:
-        amount_usd = float(quote.to_amount) / (10 ** USDT_DECIMALS) if quote.to_amount else 0.0
-    except (TypeError, ValueError):
-        amount_usd = 0.0
+        # Синхронні HTTP-виклики (get_quote/execute_swap — той самий шлях, що й
+        # для sell-сигналів з каналу в main.py) винесені в окремий потік через
+        # asyncio.to_thread, щоб НЕ блокувати спільний event loop (Telethon
+        # listener + control-бот сидять в ньому ж). На відміну від main.py, де
+        # блокуючий виклик стається раз на сигнал, тут цикл раз/2с — тому
+        # блокування тут відчутніше для чутливості control-бота на команди.
+        quote = await asyncio.to_thread(dex.get_quote, buy.contract_address, USDT_MINT_SOLANA, amount_raw)
+        if not quote.success:
+            logger.warning(f"{close_reason}: помилка quote для {buy.token_symbol}: {quote.error}")
+            return False
 
-    # --- Перевірка розбіжності: DexScreener-ціна тригера vs реальна ціна OKX ---
-    # Стосується ЛИШЕ автоматичних спрацювань ladder TP/SL (close_reason з
-    # префіксом stop_loss_/take_profit_) — прямі sell-сигнали з каналу і
-    # reply-sell евристики цю перевірку НЕ проходять (у них немає "тригера
-    # за іншою ціною", який можна було б звірити — юзер сам вирішив продати).
-    # Це ОКРЕМА перевірка від check_price_impact (core/risk_manager.py) —
-    # та стосується власного price impact ОДНОГО свопу, а не розбіжності
-    # МІЖ двома різними джерелами ціни (DexScreener проти OKX).
-    #
-    # Через відсутність decimals токена в цій системі (token_amount/
-    # sell_raw_amount — сирі, найменші одиниці; entry_price/current_price —
-    # USD за ЦІЛИЙ токен з DexScreener) пряме порівняння "ціна_OKX $ проти
-    # ціна_DexScreener $" неможливе без знання decimals. Замість цього
-    # порівнюємо RATIO: "% зміни ціни, який неявно випливає з реального
-    # котирування OKX" (окремо для собівартості на raw-юніт, той самий
-    # decimals-незалежний підхід, що вже в pnl_usd нижче) проти "% зміни
-    # ціни, яку показав DexScreener і яка викликала тригер" (pct_change).
-    # Математично еквівалентно порівнянню абсолютних цін, бо обидві сторони
-    # виражені відносно ОДНІЄЇ й тієї самої точки відліку (вхід у позицію).
-    # force_dry_run виключено з цієї перевірки: це ЛИШЕ кнопка "🧪 Тест"
-    # (core/self_test.py) — вона свідомо використовує синтетичні
-    # entry_price/amount_usd (напр. $10 за 1,000,000 raw-юнітів) проти
-    # РЕАЛЬНОГО OKX quote на справжній Wrapped SOL, тож "очікувана" ціна за
-    # цими фейковими числами не має нічого спільного з реальним котируванням
-    # — розбіжність завжди була б величезною і блокувала б КОЖЕН рівень
-    # тесту. Оскільки force_dry_run=True вже гарантує, що жодного реального
-    # свопу не буде (execute_swap завжди повертає симуляцію), захищати тут
-    # нічого — перевірка існує для РЕАЛЬНИХ грошей, а не для тесту логіки
-    # порогів.
-    is_ladder_trigger = close_reason.startswith("stop_loss_") or close_reason.startswith("take_profit_")
-    if (
-        is_ladder_trigger and not force_dry_run
-        and current_price is not None and buy.entry_price and buy.amount_usd and buy.token_amount
-    ):
-        pct_change_dexscreener = (current_price - buy.entry_price) / buy.entry_price
-        cost_per_raw_unit = buy.amount_usd / buy.token_amount
-        expected_price_per_raw_unit = cost_per_raw_unit * (1 + pct_change_dexscreener)
-        actual_price_per_raw_unit = amount_usd / sell_raw_amount
-        if expected_price_per_raw_unit != 0:
-            divergence_pct = abs(
-                actual_price_per_raw_unit - expected_price_per_raw_unit
-            ) / abs(expected_price_per_raw_unit) * 100
-            max_divergence_pct = get_limit("MAX_PRICE_DIVERGENCE_PCT")
-            if divergence_pct > max_divergence_pct:
-                logger.warning(
-                    f"{close_reason}: розбіжність цін {divergence_pct:.1f}% (DexScreener-тригер "
-                    f"vs реальний OKX quote) перевищує ліміт {max_divergence_pct}% для "
-                    f"{buy.token_symbol} — своп ПРИЗУПИНЕНО на цьому циклі, рівень НЕ позначено "
-                    f"спрацьованим, перевірка повториться наступного циклу."
-                )
-                await notify_owner(
-                    f"⚠️ Розбіжність цін {divergence_pct:.1f}% перевищує ліміт "
-                    f"{max_divergence_pct}% для {display_token_symbol(buy.token_symbol, buy.contract_address)} "
-                    f"— своп призупинено, рівень {close_reason} буде перевірено повторно "
-                    f"наступного циклу."
-                )
-                # TODO: якщо розбіжність постійно перевищує поріг кілька циклів
-                # поспіль (напр. 5+) для однієї й тієї ж позиції — варто окремо
-                # сповістити "позиція застрягла, можливо потрібне ручне
-                # втручання" (лічильник послідовних divergence-пропусків на
-                # buy.id тут не ведеться, свідомо залишено на майбутнє рішення).
-                return False
+        # amount_usd — з quote.to_amount (реальна кількість USDT за курсом свопу),
+        # а не sell_raw_amount * current_price (DexScreener-ціна) — курс свопу і
+        # ринкова ціна DexScreener можуть трохи розходитись (price impact, спред).
+        # Рахуємо ДО execute_swap(), бо нижче він же потрібен для перевірки
+        # розбіжності цін (MAX_PRICE_DIVERGENCE_PCT) — перед виконанням свопу,
+        # а не після.
+        try:
+            amount_usd = float(quote.to_amount) / (10 ** USDT_DECIMALS) if quote.to_amount else 0.0
+        except (TypeError, ValueError):
+            amount_usd = 0.0
 
-    # --- PnL для ЦІЄЇ конкретної частки, що продається ---
-    # cost_per_raw_unit = скільки USD коштував ОДИН raw-юніт токена на вході
-    # (buy.amount_usd / buy.token_amount) — decimals довільного токена
-    # скорочуються в цьому співвідношенні, тому не треба їх окремо знати.
-    # pnl = виручка за цю частку - собівартість цієї ж частки. НЕ враховує
-    # комісії мережі/сліпедж понад те, що вже відображено в amount_usd з
-    # реального quote — окремих даних про комісії система не збирає.
-    # Рахуємо ДО execute_swap() — amount_usd (з quote) вже відомий, і pnl_usd
-    # можна одразу покласти в pending-рядок нижче.
-    pnl_usd = None
-    if buy.amount_usd is not None and buy.token_amount:
-        cost_basis_usd = (buy.amount_usd / buy.token_amount) * sell_raw_amount
-        pnl_usd = amount_usd - cost_basis_usd
+        # --- Перевірка розбіжності: DexScreener-ціна тригера vs реальна ціна OKX ---
+        # Стосується ЛИШЕ автоматичних спрацювань ladder TP/SL (close_reason з
+        # префіксом stop_loss_/take_profit_) — прямі sell-сигнали з каналу і
+        # reply-sell евристики цю перевірку НЕ проходять (у них немає "тригера
+        # за іншою ціною", який можна було б звірити — юзер сам вирішив продати).
+        # Це ОКРЕМА перевірка від check_price_impact (core/risk_manager.py) —
+        # та стосується власного price impact ОДНОГО свопу, а не розбіжності
+        # МІЖ двома різними джерелами ціни (DexScreener проти OKX).
+        #
+        # Через відсутність decimals токена в цій системі (token_amount/
+        # sell_raw_amount — сирі, найменші одиниці; entry_price/current_price —
+        # USD за ЦІЛИЙ токен з DexScreener) пряме порівняння "ціна_OKX $ проти
+        # ціна_DexScreener $" неможливе без знання decimals. Замість цього
+        # порівнюємо RATIO: "% зміни ціни, який неявно випливає з реального
+        # котирування OKX" (окремо для собівартості на raw-юніт, той самий
+        # decimals-незалежний підхід, що вже в pnl_usd нижче) проти "% зміни
+        # ціни, яку показав DexScreener і яка викликала тригер" (pct_change).
+        # Математично еквівалентно порівнянню абсолютних цін, бо обидві сторони
+        # виражені відносно ОДНІЄЇ й тієї самої точки відліку (вхід у позицію).
+        # force_dry_run виключено з цієї перевірки: це ЛИШЕ кнопка "🧪 Тест"
+        # (core/self_test.py) — вона свідомо використовує синтетичні
+        # entry_price/amount_usd (напр. $10 за 1,000,000 raw-юнітів) проти
+        # РЕАЛЬНОГО OKX quote на справжній Wrapped SOL, тож "очікувана" ціна за
+        # цими фейковими числами не має нічого спільного з реальним котируванням
+        # — розбіжність завжди була б величезною і блокувала б КОЖЕН рівень
+        # тесту. Оскільки force_dry_run=True вже гарантує, що жодного реального
+        # свопу не буде (execute_swap завжди повертає симуляцію), захищати тут
+        # нічого — перевірка існує для РЕАЛЬНИХ грошей, а не для тесту логіки
+        # порогів.
+        is_ladder_trigger = close_reason.startswith("stop_loss_") or close_reason.startswith("take_profit_")
+        if (
+            is_ladder_trigger and not force_dry_run
+            and current_price is not None and buy.entry_price and buy.amount_usd and buy.token_amount
+        ):
+            pct_change_dexscreener = (current_price - buy.entry_price) / buy.entry_price
+            cost_per_raw_unit = buy.amount_usd / buy.token_amount
+            expected_price_per_raw_unit = cost_per_raw_unit * (1 + pct_change_dexscreener)
+            actual_price_per_raw_unit = amount_usd / sell_raw_amount
+            if expected_price_per_raw_unit != 0:
+                divergence_pct = abs(
+                    actual_price_per_raw_unit - expected_price_per_raw_unit
+                ) / abs(expected_price_per_raw_unit) * 100
+                max_divergence_pct = get_limit("MAX_PRICE_DIVERGENCE_PCT")
+                if divergence_pct > max_divergence_pct:
+                    logger.warning(
+                        f"{close_reason}: розбіжність цін {divergence_pct:.1f}% (DexScreener-тригер "
+                        f"vs реальний OKX quote) перевищує ліміт {max_divergence_pct}% для "
+                        f"{buy.token_symbol} — своп ПРИЗУПИНЕНО на цьому циклі, рівень НЕ позначено "
+                        f"спрацьованим, перевірка повториться наступного циклу."
+                    )
+                    await notify_owner(
+                        f"⚠️ Розбіжність цін {divergence_pct:.1f}% перевищує ліміт "
+                        f"{max_divergence_pct}% для {display_token_symbol(buy.token_symbol, buy.contract_address)} "
+                        f"— своп призупинено, рівень {close_reason} буде перевірено повторно "
+                        f"наступного циклу."
+                    )
+                    # TODO: якщо розбіжність постійно перевищує поріг кілька циклів
+                    # поспіль (напр. 5+) для однієї й тієї ж позиції — варто окремо
+                    # сповістити "позиція застрягла, можливо потрібне ручне
+                    # втручання" (лічильник послідовних divergence-пропусків на
+                    # buy.id тут не ведеться, свідомо залишено на майбутнє рішення).
+                    return False
 
-    # --- Pending-запис ДО свопу (П.2) ---
-    # Якщо процес впаде між відправкою транзакції і записом результату —
-    # без цього кроку бот "загубив" би позицію (гроші реально рухались, а в
-    # БД жодного сліду). status="pending" рядок хоча б лишається видимим і
-    # /status показує його як "застряглий" після 5хв.
-    sell_trade = Trade(
-        action="sell",
-        token_symbol=buy.token_symbol,
-        contract_address=buy.contract_address,
-        chain=buy.chain,
-        amount_usd=amount_usd,
-        pnl_usd=pnl_usd,
-        token_amount=sell_raw_amount,
-        dry_run=force_dry_run or settings.dry_run,
-        status="pending",
-        parent_trade_id=buy.id,
-        close_reason=close_reason,
-    )
-    session.add(sell_trade)
-    session.commit()
+        # --- PnL для ЦІЄЇ конкретної частки, що продається ---
+        # cost_per_raw_unit = скільки USD коштував ОДИН raw-юніт токена на вході
+        # (buy.amount_usd / buy.token_amount) — decimals довільного токена
+        # скорочуються в цьому співвідношенні, тому не треба їх окремо знати.
+        # pnl = виручка за цю частку - собівартість цієї ж частки. НЕ враховує
+        # комісії мережі/сліпедж понад те, що вже відображено в amount_usd з
+        # реального quote — окремих даних про комісії система не збирає.
+        # Рахуємо ДО execute_swap() — amount_usd (з quote) вже відомий, і pnl_usd
+        # можна одразу покласти в pending-рядок нижче.
+        pnl_usd = None
+        if buy.amount_usd is not None and buy.token_amount:
+            cost_basis_usd = (buy.amount_usd / buy.token_amount) * sell_raw_amount
+            pnl_usd = amount_usd - cost_basis_usd
 
-    swap_result = await asyncio.to_thread(
-        dex.execute_swap,
-        buy.contract_address, USDT_MINT_SOLANA, amount_raw,
-        wallet_address="<буде підставлено з гаманця>",
-        slippage_pct=settings.max_slippage_pct,
-        chain_id="501",
-        force_dry_run=force_dry_run,
-    )
+        # --- Pending-запис ДО свопу (П.2) ---
+        # Якщо процес впаде між відправкою транзакції і записом результату —
+        # без цього кроку бот "загубив" би позицію (гроші реально рухались, а в
+        # БД жодного сліду). status="pending" рядок хоча б лишається видимим і
+        # /status показує його як "застряглий" після 5хв.
+        sell_trade = Trade(
+            action="sell",
+            token_symbol=buy.token_symbol,
+            contract_address=buy.contract_address,
+            chain=buy.chain,
+            amount_usd=amount_usd,
+            pnl_usd=pnl_usd,
+            token_amount=sell_raw_amount,
+            dry_run=force_dry_run or settings.dry_run,
+            status="pending",
+            parent_trade_id=buy.id,
+            close_reason=close_reason,
+        )
+        session.add(sell_trade)
+        session.commit()
 
-    # --- Оновлюємо ТОЙ САМИЙ pending-рядок (не створюємо новий) ---
-    sell_trade.tx_hash = swap_result.tx_hash
-    sell_trade.dry_run = swap_result.dry_run
-    sell_trade.status = "confirmed" if swap_result.success else "failed"
-    if not swap_result.success:
-        sell_trade.failure_reason = swap_result.error
-    session.add(sell_trade)
+        swap_result = await asyncio.to_thread(
+            dex.execute_swap,
+            buy.contract_address, USDT_MINT_SOLANA, amount_raw,
+            wallet_address="<буде підставлено з гаманця>",
+            slippage_pct=settings.max_slippage_pct,
+            chain_id="501",
+            force_dry_run=force_dry_run,
+        )
 
-    if swap_result.success:
-        _mark_triggered(buy, close_reason)
-    else:
-        # Своп не вдався — НЕ позначаємо рівень як спрацьований: для ladder-
-        # рівнів це дозволяє спробувати ще раз наступного циклу (раз/2с);
-        # для reply-sell це нейтрально (повторного виклику однаково не буде).
-        logger.warning(f"{close_reason}: своп для {buy.token_symbol} не вдався: {swap_result.error}")
+        # --- Оновлюємо ТОЙ САМИЙ pending-рядок (не створюємо новий) ---
+        sell_trade.tx_hash = swap_result.tx_hash
+        sell_trade.dry_run = swap_result.dry_run
+        sell_trade.status = "confirmed" if swap_result.success else "failed"
+        if not swap_result.success:
+            sell_trade.failure_reason = swap_result.error
+        session.add(sell_trade)
 
-    session.add(buy)
-    session.commit()
+        if swap_result.success:
+            _mark_triggered(buy, close_reason)
+        else:
+            # Своп не вдався — НЕ позначаємо рівень як спрацьований: для ladder-
+            # рівнів це дозволяє спробувати ще раз наступного циклу (раз/2с);
+            # для reply-sell це нейтрально (повторного виклику однаково не буде).
+            logger.warning(f"{close_reason}: своп для {buy.token_symbol} не вдався: {swap_result.error}")
+
+        session.add(buy)
+        session.commit()
+    # --- lock звільнено тут (async with вище) — усе, що нижче, вже не
+    # стосується узгодження залишку, тільки формування сповіщення ---
 
     # close_reason визначає, звідки прийшов цей sell — три джерела ділять
     # цю саму функцію (ladder, reply-sell евристика, прямий sell-сигнал з

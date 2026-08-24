@@ -3,6 +3,8 @@ Ladder TP/SL: послідовні рівні, epsilon на межі порог�
 guard (MAX_PRICE_DIVERGENCE_PCT), і pending/failed edge cases П.2 для
 execute_partial_sell().
 """
+import asyncio
+
 import pytest
 
 import core.position_monitor as pm
@@ -232,4 +234,110 @@ async def test_failed_swap_marks_failed_and_position_stays_open():
     remaining_after = pm.remaining_amount(session, buy)
     assert remaining_after == remaining_before, (
         "невдалий (failed) sell НЕ має зменшувати remaining_amount — позиція лишається такою ж відкритою"
+    )
+
+
+# --- П.1 (повторний аудит): per-позиція lock у execute_partial_sell() ---
+
+def _mock_quote_and_swap(monkeypatch, delay: float = 0.03):
+    """Мок quote/execute_swap з невеликою затримкою (реальний thread pool через
+    to_thread) — дає шанс ДРУГІЙ паралельній задачі теж дійти до критичної секції."""
+    import time as time_module
+
+    def mock_quote(from_token, to_token, amount_raw, chain_id="501"):
+        time_module.sleep(delay)
+        raw = float(amount_raw)
+        return QuoteResult(success=True, from_amount=amount_raw, to_amount=str(int(raw * 0.07)), price_impact_pct=0.0)
+
+    def mock_swap(*a, **kw):
+        time_module.sleep(delay)
+        return SwapResult(success=True, tx_hash="TX", dry_run=True)
+
+    monkeypatch.setattr(pm.dex, "get_quote", mock_quote)
+    monkeypatch.setattr(pm.dex, "execute_swap", mock_swap)
+
+
+async def test_concurrent_ladder_and_signal_sell_do_not_oversell(monkeypatch):
+    """
+    Edge case 1+2: ladder-тригер (-20%) і прямий sell-сигнал по ТОМУ Ж buy_id
+    запущені паралельно, обидва "прочитали" повний залишок ДО виклику (як це
+    реально відбувається в main.py/_check_position — caller рахує sell_raw_amount
+    ще ДО критичної секції). Сумарно продано не більше за початковий залишок;
+    другий викликач або продає менший (новий) залишок, або тихо виходить.
+    """
+    session = get_session()
+    buy = _make_buy(session, entry_price=0.001, amount_usd=10.0, token_amount=1_000_000.0)
+    _mock_quote_and_swap(monkeypatch, delay=0.03)
+
+    # Обидва викликачі незалежно "побачили" повний залишок 1,000,000 ДО того,
+    # як хтось із них зайняв лок — так само, як реальні callers у продакшн-коді.
+    task_ladder = asyncio.create_task(
+        pm.execute_partial_sell(session, buy, "stop_loss_-20pct", 1_000_000.0, buy.entry_price * 0.80, force_dry_run=False)
+    )
+    task_signal = asyncio.create_task(
+        pm.execute_partial_sell(session, buy, "signal_sell", 1_000_000.0, buy.entry_price * 0.80, force_dry_run=False)
+    )
+    results = await asyncio.gather(task_ladder, task_signal)
+
+    sells = session.query(Trade).filter(Trade.parent_trade_id == buy.id).all()
+    total_sold = sum(s.token_amount for s in sells if s.status == "confirmed")
+    assert total_sold <= 1_000_000.0 + 1e-6, f"продано {total_sold}, більше за початковий залишок 1,000,000"
+    assert pm.remaining_amount(session, buy) >= -1e-6, "remaining не має стати від'ємним"
+
+    # Один з двох мав реально продати (сумарно рівно 1,000,000, бо перший запросив усе)
+    assert any(results), "хоча б один з паралельних викликів мав успішно продати"
+    assert total_sold == pytest.approx(1_000_000.0), (
+        "перший запросив 100% залишку — сумарно мало піти рівно 1,000,000, без подвійного продажу і без втрати"
+    )
+
+
+async def test_lock_released_after_exception_second_call_does_not_hang(monkeypatch):
+    """Edge case 3: якщо перший виклик впаде ВСЕРЕДИНІ критичної секції (лок вже
+    зайнятий), другий виклик на ТОЙ САМИЙ buy_id не має зависнути назавжди."""
+    session = get_session()
+    buy = _make_buy(session)
+
+    def mock_quote(*a, **kw):
+        return QuoteResult(success=True, from_amount="500000", to_amount="35000", price_impact_pct=0.0)
+    monkeypatch.setattr(pm.dex, "get_quote", mock_quote)
+
+    def crash(*a, **kw):
+        raise RuntimeError("крах всередині критичної секції, лок ще утримується")
+    monkeypatch.setattr(pm.dex, "execute_swap", crash)
+
+    with pytest.raises(RuntimeError):
+        await pm.execute_partial_sell(session, buy, "stop_loss_-10pct", 500_000.0, buy.entry_price * 0.90, force_dry_run=False)
+
+    # Другий виклик на ТОЙ САМИЙ buy_id — лок мав звільнитись (async with),
+    # інакше цей await завис би назавжди й asyncio.wait_for кинув би TimeoutError.
+    monkeypatch.setattr(pm.dex, "execute_swap", lambda *a, **kw: SwapResult(success=True, tx_hash="OK", dry_run=True))
+    result = await asyncio.wait_for(
+        pm.execute_partial_sell(session, buy, "stop_loss_-10pct", 500_000.0, buy.entry_price * 0.90, force_dry_run=False),
+        timeout=2.0,
+    )
+    assert result is True
+
+
+async def test_different_positions_do_not_block_each_other(monkeypatch):
+    """Edge case 4: lock пер-позиція не має серіалізувати НЕпов'язані продажі —
+    дві РІЗНІ позиції продаються приблизно за час ОДНІЄЇ операції, не двох."""
+    session = get_session()
+    buy_a = _make_buy(session, entry_price=0.001, amount_usd=10.0, token_amount=1_000_000.0)
+    buy_b = _make_buy(session, entry_price=0.002, amount_usd=20.0, token_amount=2_000_000.0)
+    delay = 0.15
+    _mock_quote_and_swap(monkeypatch, delay=delay)
+
+    import time as time_module
+    start = time_module.monotonic()
+    await asyncio.gather(
+        pm.execute_partial_sell(session, buy_a, "stop_loss_-10pct", 500_000.0, buy_a.entry_price * 0.90, force_dry_run=False),
+        pm.execute_partial_sell(session, buy_b, "stop_loss_-10pct", 1_000_000.0, buy_b.entry_price * 0.90, force_dry_run=False),
+    )
+    elapsed = time_module.monotonic() - start
+
+    # Послідовно (серіалізовано) це зайняло б ~2*2*delay (quote+swap кожен),
+    # паралельно — ~2*delay. Даємо великий запас, головне — НЕ ~4*delay.
+    assert elapsed < delay * 3, (
+        f"дві незалежні позиції зайняли {elapsed:.2f}с (delay={delay}) — схоже, lock пер-позиція "
+        f"серіалізує непов'язані продажі"
     )

@@ -144,3 +144,33 @@ async def test_event_loop_stays_responsive_during_slow_signal(monkeypatch):
         f"швидкий запит зайняв {fast_elapsed:.3f}с — event loop, схоже, заблокований повільним сигналом"
     )
     await signal_task
+
+
+async def test_event_loop_stays_responsive_during_slow_claude_parse(monkeypatch):
+    """
+    П.2 (повторний аудит): parser.parse() тепер теж через asyncio.to_thread.
+    Мокаємо ЛИШЕ parse() з затримкою (а не OKX-виклики) — event loop все одно
+    має лишатись вільним саме на час розбору сигналу Claude API.
+    """
+    _set_dry_run(True)
+    _install_common_mocks(monkeypatch, delay=0.0)  # інші виклики миттєві
+    monkeypatch.setattr(main_module, "notify", lambda client, text: asyncio.sleep(0))
+
+    def slow_parse(text):
+        time.sleep(0.3)  # "повільний" виклик Claude API, виконується в thread pool
+        return _fake_parsed("SlowClaudeContract")
+
+    monkeypatch.setattr(main_module.parser, "parse", slow_parse)
+
+    signal_task = asyncio.create_task(main_module.process_signal(None, "slow claude signal"))
+
+    start = time.monotonic()
+    await asyncio.sleep(0.01)
+    session = get_session()
+    _ = session.query(Trade).count()
+    fast_elapsed = time.monotonic() - start
+
+    assert fast_elapsed < 0.15, (
+        f"швидкий запит зайняв {fast_elapsed:.3f}с — event loop заблокований повільним parser.parse()"
+    )
+    await signal_task

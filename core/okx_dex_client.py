@@ -28,10 +28,43 @@ from typing import Optional
 from urllib.parse import urlencode
 
 import httpx
+from tenacity import (
+    retry, retry_if_exception, stop_after_attempt, wait_exponential, before_sleep_log,
+)
 
 from core.config import settings
 
 logger = logging.getLogger(__name__)
+
+
+def _is_transient_http_error(exc: BaseException) -> bool:
+    """
+    Ретраїмо ЛИШЕ явно транзієнтні збої: мережеві (таймаут, обрив з'єднання —
+    httpx.TransportError, немає навіть HTTP-відповіді) або 5xx від сервера
+    (проблема на боці OKX, не наша). 4xx (погані параметри запиту, невалідна
+    адреса контракту, авторизація) — НЕ ретраїмо: повтор з тими самими
+    параметрами дасть ту саму помилку знову, тільки затримає обробку сигналу.
+    Логічні відмови OKX (JSON-відповідь з code != "0", напр. недостатня
+    ліквідність) взагалі не проходять через це — вони не кидають виняток,
+    обробляються окремо в get_quote()/execute_swap() без ретраю.
+    """
+    if isinstance(exc, httpx.TransportError):
+        return True
+    if isinstance(exc, httpx.HTTPStatusError):
+        return exc.response.status_code >= 500
+    return False
+
+
+# Максимум 3 спроби, базова затримка ~1с, exponential (1с → 2с) — досить
+# швидко, щоб не пропустити вікно волатильної ціни memecoin, але дає шанс
+# пережити одноразовий мережевий глюк чи короткочасну 5xx-нестабільність OKX.
+_okx_retry = retry(
+    retry=retry_if_exception(_is_transient_http_error),
+    stop=stop_after_attempt(3),
+    wait=wait_exponential(multiplier=1, min=1, max=4),
+    reraise=True,
+    before_sleep=before_sleep_log(logger, logging.WARNING),
+)
 
 OKX_BASE_URL = "https://web3.okx.com"
 SOLANA_CHAIN_ID = "501"  # ідентифікатор Solana в OKX DEX API
@@ -113,6 +146,26 @@ class OKXDexClient:
             "Content-Type": "application/json",
         }
 
+    @_okx_retry
+    def _get_with_retry(self, url: str, request_path: str) -> httpx.Response:
+        """
+        Спільний для get_quote()/execute_swap() GET-виклик з ретраєм на
+        транзієнтні збої (див. _is_transient_http_error/_okx_retry вище).
+        tenacity сам логує кожну спробу через before_sleep_log — тут
+        додатково НЕ дублюємо лог, щоб не засмічувати виведення.
+
+        Заголовки (self._headers) генеруються ЗАНОВО на кожну спробу (а не
+        один раз до виклику) — OK-ACCESS-TIMESTAMP і підпис прив'язані до
+        конкретного моменту часу; якщо retry станеться через 1-2с, а OKX
+        звіряє свіжість timestamp з якимось вузьким вікном, повторне
+        використання СТАРОГО підпису могло б само по собі стати причиною
+        відмови на другій спробі — незалежно від того, чи вирішилась
+        оригінальна транзієнтна проблема.
+        """
+        resp = self.client.get(url, headers=self._headers("GET", request_path))
+        resp.raise_for_status()
+        return resp
+
     @staticmethod
     def _build_url_and_signed_path(path: str, params: dict) -> tuple[str, str]:
         """
@@ -149,8 +202,7 @@ class OKXDexClient:
         }
         url, request_path = self._build_url_and_signed_path(path, params)
         try:
-            resp = self.client.get(url, headers=self._headers("GET", request_path))
-            resp.raise_for_status()
+            resp = self._get_with_retry(url, request_path)
             data = resp.json()
             if data.get("code") != "0":
                 return QuoteResult(success=False, error=data.get("msg", "unknown error"))
@@ -217,8 +269,7 @@ class OKXDexClient:
         }
         url, request_path = self._build_url_and_signed_path(path, params)
         try:
-            resp = self.client.get(url, headers=self._headers("GET", request_path))
-            resp.raise_for_status()
+            resp = self._get_with_retry(url, request_path)
             data = resp.json()
             if data.get("code") != "0":
                 return SwapResult(success=False, dry_run=False, error=data.get("msg"))
