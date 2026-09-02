@@ -9,8 +9,9 @@ import pytest
 
 from core.config import settings
 import core.runtime_state as runtime_state
-from core.control_bot import IsAllowed, IsAdmin, get_role, _open_positions_total_usd
+from core.control_bot import IsAllowed, IsAdmin, get_role, _open_positions_total_usd, _force_close_position
 from core.storage import get_session, Trade, TEST_TOKEN_SYMBOL
+from core.position_monitor import remaining_amount, _position_locks, _divergence_block_counts
 
 
 def _set_owner(user_id: int):
@@ -87,3 +88,95 @@ def test_open_positions_total_usd_excludes_test_token():
 
     total = _open_positions_total_usd(session)
     assert total == pytest.approx(5.0), f"тестова позиція $100 не мала потрапити в підсумок, отримано {total}"
+
+
+# --- Примусове закриття позиції ---
+
+def _make_open_buy(session, amount_usd=100.0, token_amount=1_000_000.0):
+    buy = Trade(
+        action="buy", token_symbol="RUGCOIN", contract_address="RUGC1",
+        chain="solana", amount_usd=amount_usd, dry_run=True, status="confirmed",
+        entry_price=0.0001, token_amount=token_amount, triggered_levels="[]",
+    )
+    session.add(buy)
+    session.commit()
+    return buy
+
+
+async def test_force_close_zeroes_remaining_and_records_full_loss():
+    session = get_session()
+    buy = _make_open_buy(session, amount_usd=100.0, token_amount=1_000_000.0)
+    assert remaining_amount(session, buy) == pytest.approx(1_000_000.0)
+
+    success, msg = await _force_close_position(buy.id)
+
+    assert success is True
+    assert "примусово закрито" in msg
+    assert "$100.00" in msg
+
+    session2 = get_session()
+    buy2 = session2.get(Trade, buy.id)
+    assert remaining_amount(session2, buy2) == pytest.approx(0.0, abs=1e-6)
+
+    sells = session2.query(Trade).filter(Trade.parent_trade_id == buy.id).all()
+    assert len(sells) == 1
+    assert sells[0].close_reason == "manual_force_close"
+    assert sells[0].status == "confirmed"
+    assert sells[0].amount_usd == 0.0
+    assert sells[0].pnl_usd == pytest.approx(-100.0), "весь залишок мав зарахуватись як повний збиток, не 0 і не прибуток"
+
+
+async def test_force_close_excluded_from_open_positions():
+    from core.position_monitor import _get_open_positions
+
+    session = get_session()
+    buy = _make_open_buy(session)
+    assert len(_get_open_positions(session)) == 1
+
+    await _force_close_position(buy.id)
+
+    session2 = get_session()
+    assert _get_open_positions(session2) == [], "закрита позиція не має більше з'являтись у ladder-моніторингу"
+
+
+async def test_force_close_clears_lock_and_divergence_counter():
+    session = get_session()
+    buy = _make_open_buy(session)
+    _position_locks[buy.id] = __import__("asyncio").Lock()
+    _divergence_block_counts[buy.id] = 3
+
+    await _force_close_position(buy.id)
+
+    assert buy.id not in _position_locks
+    assert buy.id not in _divergence_block_counts
+
+
+async def test_force_close_already_closed_position_fails_gracefully():
+    session = get_session()
+    buy = _make_open_buy(session, amount_usd=50.0, token_amount=500_000.0)
+    success1, _ = await _force_close_position(buy.id)
+    assert success1 is True
+
+    success2, msg2 = await _force_close_position(buy.id)
+    assert success2 is False
+    assert "вже закрита" in msg2
+
+
+async def test_force_close_nonexistent_buy_id_fails_gracefully():
+    success, msg = await _force_close_position(999_999)
+    assert success is False
+    assert "не знайдено" in msg
+
+
+async def test_force_close_stats_show_loss_not_profit():
+    from core.stats import _compute_trade_stats
+
+    session = get_session()
+    buy = _make_open_buy(session, amount_usd=75.0, token_amount=1_000_000.0)
+    await _force_close_position(buy.id)
+
+    session2 = get_session()
+    t = _compute_trade_stats(session2, __import__("datetime").datetime(2000, 1, 1), dry_run=True)
+    assert t.total_pnl_usd is not None
+    assert t.total_pnl_usd == pytest.approx(-75.0), "статистика має показати повний збиток, не пропустити і не показати прибуток"
+    assert t.winning_sell_count == 0

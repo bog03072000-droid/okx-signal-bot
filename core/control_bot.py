@@ -344,51 +344,172 @@ def _open_positions_total_usd(session) -> float:
 @router.message(Command("positions"), is_allowed)
 @router.message(F.text == "📈 Позиції", is_allowed)
 async def cmd_positions(message: Message):
+    """
+    На відміну від старої версії (групування по contract_address) — тепер
+    показує ОКРЕМИЙ рядок на КОЖЕН відкритий buy-рядок (buy.id), а не
+    згруповано по контракту. Причина: примусове закриття (❌ нижче) діє на
+    конкретний buy_id, а групування по контракту робило б неможливим
+    однозначно вказати, ЯКУ саме позицію закривати, якби по тому самому
+    контракту колись існувало кілька окремих buy-рядків.
+    """
+    from core.position_monitor import remaining_amount, POSITION_EPSILON
+
     session = get_session()
     try:
-        # Групування "відкритих" позицій ПО КОНТРАКТУ (не по token_symbol!) —
-        # token_symbol часто NULL (SignalParser не завжди має звідки взяти
-        # тікер, див. core/formatting.py:display_token_symbol), і групування
-        # по token_symbol раніше зливало ВСІ токени без тікера в одну спільну
-        # групу "None", помилково підсумовуючи USD непов'язаних позицій разом.
-        # func.max(token_symbol) бере тікер там, де він є, для показу.
-        # Сума buy мінус сума sell в USD — НЕ реальна кількість токенів і НЕ
-        # поточний PnL, просто скільки USD ще "в грі" по позиції станом на
-        # ціни купівлі. Реальний PnL вимагає окремого моніторингу поточної
-        # ціни (не реалізовано, див. README).
         # Trade.token_symbol.isnot(TEST_TOKEN_SYMBOL) — виключає тестові
         # угоди від кнопки "🧪 Тест" (isnot(), не "!=", щоб не зачепити й
         # реальні рядки з token_symbol=NULL, див. коментар в core/stats.py).
-        rows = session.query(
-            Trade.contract_address,
-            func.max(Trade.token_symbol),
-            Trade.action,
-            func.sum(Trade.amount_usd),
-        ).filter(
-            Trade.status == "confirmed",
+        open_buys = session.query(Trade).filter(
+            Trade.action == "buy", Trade.status == "confirmed",
             Trade.token_symbol.isnot(TEST_TOKEN_SYMBOL),
-        ).group_by(Trade.contract_address, Trade.action).all()
+        ).order_by(Trade.created_at.desc()).all()
 
-        net_by_contract: dict[str, list] = {}  # contract -> [net_usd, token_symbol]
-        for contract_address, token_symbol, action, total in rows:
-            entry = net_by_contract.setdefault(contract_address, [0.0, token_symbol])
-            entry[0] += total if action == "buy" else -total
-            if token_symbol:
-                entry[1] = token_symbol
+        rows_data = []
+        for buy in open_buys:
+            remaining = remaining_amount(session, buy)
+            if remaining <= POSITION_EPSILON:
+                continue
+            # USD, пропорційний залишку (не весь buy.amount_usd) — якщо
+            # частину вже продано по ladder TP/SL, показуємо лише те, що
+            # реально ще "в грі", а не первинний розмір угоди.
+            usd_in_position = 0.0
+            if buy.amount_usd and buy.token_amount:
+                usd_in_position = buy.amount_usd * (remaining / buy.token_amount)
+            rows_data.append((buy, usd_in_position))
 
-        open_positions = {c: v for c, v in net_by_contract.items() if v[0] > 0.01}
-
-        if not open_positions:
+        if not rows_data:
             await message.answer("📭 Немає відкритих позицій.")
             return
 
+        # PnL н/д — без моніторингу поточної ціни ТУТ (ladder-монітор рахує
+        # це окремо для власних потреб, core/position_monitor.py).
         lines = ["📈 <b>Відкриті позиції</b> (PnL н/д — без моніторингу ціни в реальному часі)"]
-        for contract_address, (usd, token_symbol) in sorted(open_positions.items(), key=lambda x: -x[1][0]):
-            label = display_token_symbol(token_symbol, contract_address)
+        keyboard_rows = []
+        is_admin_role = get_role(message.from_user.id) == "admin"
+        for buy, usd in sorted(rows_data, key=lambda x: -x[1]):
+            label = display_token_symbol(buy.token_symbol, buy.contract_address)
             lines.append(f"• {label}: ≈ ${usd:,.2f}")
-        await message.answer("\n".join(lines), parse_mode="HTML")
+            if is_admin_role:
+                keyboard_rows.append([
+                    InlineKeyboardButton(text=f"❌ Закрити {label}", callback_data=f"forceclose:{buy.id}")
+                ])
+
+        await message.answer(
+            "\n".join(lines), parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=keyboard_rows) if keyboard_rows else None,
+        )
     finally:
         session.close()
+
+
+async def _force_close_position(buy_id: int) -> tuple[bool, str]:
+    """
+    Позначає buy-позицію примусово закритою: додає sell-рядок з
+    close_reason="manual_force_close", amount_usd=0.0 (токен вважається
+    непродаваним — власник підтвердив це вручну) і pnl_usd = -повна
+    собівартість залишку (чесний повний збиток, а не пропуск чи хибний
+    прибуток у статистиці). НІКОЛИ не звертається до OKX (жодного
+    get_quote/execute_swap) — саме для сценарію, коли токен вже недоступний
+    для реальної торгівлі (rug/делістинг), і автоматична ladder-логіка
+    застрягла на price-divergence guard (core/position_monitor.py).
+
+    Той самий per-позиція lock, що й execute_partial_sell() (core/
+    position_monitor.py) — щоб не закрити позицію ОДНОЧАСНО з тим, як
+    ladder/сигнал-sell вже продають її частку.
+    """
+    from core.position_monitor import remaining_amount, POSITION_EPSILON, _lock_for, _position_locks, _divergence_block_counts
+
+    session = get_session()
+    try:
+        buy = session.get(Trade, buy_id)
+        if not buy or buy.action != "buy" or buy.status != "confirmed":
+            return False, "Позицію не знайдено, або вона не є відкритою buy-угодою."
+
+        async with _lock_for(buy.id):
+            remaining = remaining_amount(session, buy)
+            if remaining <= POSITION_EPSILON:
+                return False, "Позиція вже закрита (залишок 0) — нічого закривати."
+
+            cost_per_raw_unit = (
+                buy.amount_usd / buy.token_amount if buy.amount_usd and buy.token_amount else 0.0
+            )
+            loss_usd = cost_per_raw_unit * remaining
+
+            sell_trade = Trade(
+                action="sell",
+                token_symbol=buy.token_symbol,
+                contract_address=buy.contract_address,
+                chain=buy.chain,
+                amount_usd=0.0,
+                pnl_usd=-loss_usd,
+                token_amount=remaining,
+                dry_run=buy.dry_run,
+                status="confirmed",
+                parent_trade_id=buy.id,
+                close_reason="manual_force_close",
+            )
+            session.add(sell_trade)
+            session.commit()
+
+        # Позиція назавжди закрита — на відміну від звичайного відкритого
+        # стану (де lock/лічильник може знадобитись багато разів наперед),
+        # тут майбутніх звернень до цього buy_id більше не буде: наступний
+        # цикл ladder-монітора вже не поверне її з _get_open_positions()
+        # (remaining_amount() тепер 0). Прибираємо "сирітський" стан.
+        _position_locks.pop(buy_id, None)
+        _divergence_block_counts.pop(buy_id, None)
+
+        label = display_token_symbol(buy.token_symbol, buy.contract_address)
+        return True, (
+            f"✅ Позицію {label} примусово закрито (manual_force_close). "
+            f"Врахована як повний збиток ${loss_usd:.2f} у статистиці."
+        )
+    finally:
+        session.close()
+
+
+def _forceclose_confirm_keyboard(buy_id: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="✅ Так, закрити", callback_data=f"forceclose_confirm:{buy_id}"),
+        InlineKeyboardButton(text="🔙 Скасувати", callback_data="forceclose_cancel"),
+    ]])
+
+
+@router.callback_query(F.data.startswith("forceclose:"), is_admin)
+async def cb_forceclose_prompt(callback: CallbackQuery):
+    buy_id = int(callback.data.split(":", 1)[1])
+    session = get_session()
+    try:
+        buy = session.get(Trade, buy_id)
+    finally:
+        session.close()
+
+    if not buy:
+        await callback.answer("Позицію не знайдено", show_alert=True)
+        return
+
+    label = display_token_symbol(buy.token_symbol, buy.contract_address)
+    await callback.message.edit_text(
+        f"⚠️ Точно закрити позицію {label}?\n"
+        "Це позначить її закритою в базі, БЕЗ спроби реального продажу на "
+        "біржі — підходить, коли токен вже недоступний для торгівлі.",
+        reply_markup=_forceclose_confirm_keyboard(buy_id),
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data == "forceclose_cancel", is_admin)
+async def cb_forceclose_cancel(callback: CallbackQuery):
+    await callback.message.edit_text("Скасовано, позицію не закрито.")
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("forceclose_confirm:"), is_admin)
+async def cb_forceclose_confirm(callback: CallbackQuery):
+    buy_id = int(callback.data.split(":", 1)[1])
+    success, result_text = await _force_close_position(buy_id)
+    await callback.message.edit_text(result_text)
+    await callback.answer()
 
 
 async def _send_history(message: Message, limit: int):
