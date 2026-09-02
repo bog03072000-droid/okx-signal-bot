@@ -816,9 +816,19 @@ async def cb_stats(callback: CallbackQuery):
     period_key = callback.data.split(":", 1)[1]
     await callback.answer()
 
+    # asyncio.to_thread — той самий синхронний Solana RPC-виклик, що й у
+    # cmd_balance() вище; format_stats_report() потребує ПОТОЧНИЙ реальний
+    # баланс для розрахунку PnL у відсотках (LIVE-секція).
+    balance = await asyncio.to_thread(get_wallet_balance)
+    # balance.is_real=False означає usdt_balance — це MOCK_WALLET_BALANCE_USD
+    # (немає/невалідний SOLANA_PRIVATE_KEY), а НЕ реальний баланс гаманця —
+    # використовувати його як базу для LIVE % було б хибним (той самий mock
+    # вже й так є базою для DRY RUN секції, format_stats_report сам його бере).
+    live_balance_usd = balance.usdt_balance if balance.is_real else None
+
     session = get_session()
     try:
-        report = format_stats_report(session, period_key)
+        report = format_stats_report(session, period_key, live_wallet_usdt_balance=live_balance_usd)
     finally:
         session.close()
 

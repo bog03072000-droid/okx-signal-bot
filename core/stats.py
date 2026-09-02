@@ -23,6 +23,7 @@ from sqlalchemy import func
 from core.storage import SignalLog, Trade, TEST_TOKEN_SYMBOL
 from core.position_monitor import remaining_amount, POSITION_EPSILON
 from core.formatting import display_token_symbol
+from core.wallet import MOCK_WALLET_BALANCE_USD
 
 PERIODS = {
     "day": ("День", dt.timedelta(days=1)),
@@ -43,6 +44,7 @@ class TradeStats:
     closed_fully: int = 0
     still_open: int = 0
     total_pnl_usd: Optional[float] = None
+    total_pnl_pct: Optional[float] = None  # None = недоступний (баланс невідомий/нульовий), не 0
     win_rate_pct: Optional[float] = None
     closed_sell_count: int = 0
     winning_sell_count: int = 0
@@ -101,7 +103,21 @@ def _compute_signal_stats(session, period_start: dt.datetime) -> SignalStats:
     return s
 
 
-def _compute_trade_stats(session, period_start: dt.datetime, dry_run: bool) -> TradeStats:
+def _compute_trade_stats(
+    session, period_start: dt.datetime, dry_run: bool, balance_usd: Optional[float] = None,
+) -> TradeStats:
+    """
+    balance_usd — база для total_pnl_pct: ПОТОЧНИЙ баланс (mock для dry-run,
+    реальний з гаманця для live) на момент виклику /статистика, а НЕ баланс
+    на початок обраного періоду (день/тиждень/місяць) — snapshot балансу на
+    початок періоду в проєкті ніде не зберігається (перевірено, немає такої
+    таблиці/поля), а заводити його заради одного відсотка — непропорційні
+    зусилля. "Поточний баланс" — простіший, технічно надійний варіант
+    (просто виклик get_wallet_balance(), який вже є), АЛЕ менш точний, якщо
+    баланс змінювався за період (поповнення/виведення) — тому текст у
+    _format_trade_block() ЯВНО каже "від поточного балансу", а не просто
+    "% дохідності", щоб не створювати хибне враження точності, якої немає.
+    """
     t = TradeStats()
 
     # Trade.token_symbol.isnot(TEST_TOKEN_SYMBOL), а НЕ "!=" — token_symbol
@@ -133,6 +149,11 @@ def _compute_trade_stats(session, period_start: dt.datetime, dry_run: bool) -> T
     pnl_sells = [s for s in sells if s.pnl_usd is not None]
     if pnl_sells:
         t.total_pnl_usd = sum(s.pnl_usd for s in pnl_sells)
+        # balance_usd може бути None (баланс невідомий, напр. RPC недоступний)
+        # або 0 — в обох випадках НЕ ділимо, лишаємо total_pnl_pct=None, а не
+        # inf/NaN чи хибний 0%.
+        if balance_usd:
+            t.total_pnl_pct = t.total_pnl_usd / balance_usd * 100
         t.closed_sell_count = len(pnl_sells)
         t.winning_sell_count = sum(1 for s in pnl_sells if s.pnl_usd > 0)
         t.win_rate_pct = (t.winning_sell_count / t.closed_sell_count) * 100
@@ -157,7 +178,7 @@ def _compute_trade_stats(session, period_start: dt.datetime, dry_run: bool) -> T
     return t
 
 
-def _format_trade_block(label: str, t: TradeStats) -> str:
+def _format_trade_block(label: str, t: TradeStats, balance_label: str) -> str:
     lines = [f"{label} Угоди:"]
     lines.append(f"• Відкрито позицій: {t.opened_positions}")
     lines.append(f"• Закрито повністю: {t.closed_fully}")
@@ -167,7 +188,8 @@ def _format_trade_block(label: str, t: TradeStats) -> str:
     if t.total_pnl_usd is None:
         lines.append("• PnL поки не відстежується (немає закритих угод із розрахованим pnl_usd за цей період)")
     else:
-        lines.append(f"• Сумарний PnL: ${t.total_pnl_usd:+.2f}")
+        pct_note = f" ({t.total_pnl_pct:+.1f}% від {balance_label})" if t.total_pnl_pct is not None else " (% недоступний — баланс невідомий)"
+        lines.append(f"• Сумарний PnL: ${t.total_pnl_usd:+.2f}{pct_note}")
         lines.append(f"• Win rate: {t.win_rate_pct:.0f}% ({t.winning_sell_count} з {t.closed_sell_count} закритих)")
         if t.best_trade:
             lines.append(f"• Найкраща угода: {t.best_trade[0]:+.1f}% ({display_token_symbol(t.best_trade[1], t.best_trade[2])})")
@@ -180,13 +202,27 @@ def _format_trade_block(label: str, t: TradeStats) -> str:
     return "\n".join(lines)
 
 
-def format_stats_report(session, period_key: str) -> str:
+def format_stats_report(session, period_key: str, live_wallet_usdt_balance: Optional[float] = None) -> str:
+    """
+    live_wallet_usdt_balance — ПОТОЧНИЙ реальний баланс USDT гаманця (не за
+    цей виклик рахується — передається готовим із control_bot.py, де його
+    отримують через asyncio.to_thread(get_wallet_balance) ДО виклику цієї
+    функції, щоб сам format_stats_report() лишався синхронним і легко
+    тестованим, без мережевого виклику всередині). None — якщо реальний
+    баланс недоступний (RPC впав, ключ не задано тощо); у такому разі
+    відсоток PnL для LIVE-секції показується як "недоступний", а не 0/inf.
+
+    Для DRY RUN базою для % завжди служить MOCK_WALLET_BALANCE_USD (core/
+    wallet.py) — той самий умовний капітал, від якого dry-run угоди й
+    рахують розмір позиції, а не будь-який реальний баланс гаманця,
+    навіть якщо він налаштований.
+    """
     period_label, _ = PERIODS[period_key]
     period_start = period_start_for(period_key)
 
     sig = _compute_signal_stats(session, period_start)
-    dry_stats = _compute_trade_stats(session, period_start, dry_run=True)
-    live_stats = _compute_trade_stats(session, period_start, dry_run=False)
+    dry_stats = _compute_trade_stats(session, period_start, dry_run=True, balance_usd=MOCK_WALLET_BALANCE_USD)
+    live_stats = _compute_trade_stats(session, period_start, dry_run=False, balance_usd=live_wallet_usdt_balance)
 
     lines = [f"📊 <b>Статистика за {period_label.lower()}</b>", ""]
     lines.append("Сигнали:")
@@ -197,8 +233,8 @@ def format_stats_report(session, period_key: str) -> str:
     lines.append(f"  — через ризик-ліміти: {sig.rejected_risk_limits}")
     lines.append(f"  — непідтримувана мережа: {sig.rejected_unsupported_network}")
     lines.append("")
-    lines.append(_format_trade_block("🧪 DRY RUN", dry_stats))
+    lines.append(_format_trade_block("🧪 DRY RUN", dry_stats, balance_label="поточного mock-балансу драй-рану"))
     lines.append("")
-    lines.append(_format_trade_block("🔴 LIVE", live_stats))
+    lines.append(_format_trade_block("🔴 LIVE", live_stats, balance_label="поточного балансу гаманця"))
 
     return "\n".join(lines)
