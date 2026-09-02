@@ -341,3 +341,75 @@ async def test_different_positions_do_not_block_each_other(monkeypatch):
         f"дві незалежні позиції зайняли {elapsed:.2f}с (delay={delay}) — схоже, lock пер-позиція "
         f"серіалізує непов'язані продажі"
     )
+
+
+# --- Ескалація для "застряглої" позиції (постійна розбіжність) ---
+
+async def test_stuck_position_escalates_every_n_cycles(monkeypatch):
+    """
+    Спостережено наживо: позиція може годинами блокуватись через розбіжність
+    цін (типово — токен втратив ліквідність). Звичайне попередження летить
+    щоцикл — окреме "🆘 застрягла" сповіщення має з'явитись лише РАЗ на
+    STUCK_DIVERGENCE_THRESHOLD_CYCLES послідовних блокувань, не щоразу.
+    """
+    session = get_session()
+    buy = _make_buy(session, triggered_levels='["stop_loss_-10pct"]')
+    cost_per_raw_unit = buy.amount_usd / buy.token_amount
+
+    notifications = []
+    async def capture(text):
+        notifications.append(text)
+    monkeypatch.setattr(pm, "notify_owner", capture)
+
+    def mock_quote(from_token, to_token, amount_raw, chain_id="501"):
+        raw = float(amount_raw)
+        price = cost_per_raw_unit * 0.10  # величезна, стабільна розбіжність від очікуваних 0.80
+        return QuoteResult(success=True, from_amount=amount_raw, to_amount=str(int(raw * price * 10**6)), price_impact_pct=0.0)
+    pm.dex.get_quote = mock_quote
+
+    n = pm.STUCK_DIVERGENCE_THRESHOLD_CYCLES
+    for _ in range(n):
+        await pm._check_position(session, buy, buy.entry_price * 0.80, force_dry_run=False)
+
+    stuck_notifications = [t for t in notifications if "застрягла" in t]
+    regular_notifications = [t for t in notifications if "Розбіжність цін" in t and "застрягла" not in t]
+
+    assert len(regular_notifications) == n, f"звичайних попереджень мало бути {n}, отримано {len(regular_notifications)}"
+    assert len(stuck_notifications) == 1, (
+        f"ескалаційне сповіщення мало з'явитись РІВНО 1 раз після {n} циклів, отримано {len(stuck_notifications)}"
+    )
+    assert "ручне втручання" in stuck_notifications[0] or "перевір токен" in stuck_notifications[0]
+
+
+async def test_stuck_position_counter_resets_after_successful_pass(monkeypatch):
+    """Щойно розбіжність повертається в межі порогу — лічильник скидається, наступна серія блокувань рахується заново."""
+    session = get_session()
+    buy = _make_buy(session, triggered_levels='["stop_loss_-10pct"]')
+    cost_per_raw_unit = buy.amount_usd / buy.token_amount
+
+    notifications = []
+    async def capture(text):
+        notifications.append(text)
+    monkeypatch.setattr(pm, "notify_owner", capture)
+    monkeypatch.setattr(pm.dex, "execute_swap", lambda *a, **kw: SwapResult(success=True, tx_hash="TX", dry_run=True))
+
+    def diverging_quote(from_token, to_token, amount_raw, chain_id="501"):
+        raw = float(amount_raw)
+        price = cost_per_raw_unit * 0.10
+        return QuoteResult(success=True, from_amount=amount_raw, to_amount=str(int(raw * price * 10**6)), price_impact_pct=0.0)
+
+    def normal_quote(from_token, to_token, amount_raw, chain_id="501"):
+        raw = float(amount_raw)
+        price = cost_per_raw_unit * 0.80  # точно очікувана ціна, розбіжність ~0%
+        return QuoteResult(success=True, from_amount=amount_raw, to_amount=str(int(raw * price * 10**6)), price_impact_pct=0.0)
+
+    # 3 блокування поспіль (менше порогу), потім один нормальний прохід (скидає лічильник)
+    pm.dex.get_quote = diverging_quote
+    for _ in range(pm.STUCK_DIVERGENCE_THRESHOLD_CYCLES - 1):
+        await pm._check_position(session, buy, buy.entry_price * 0.80, force_dry_run=False)
+    assert buy.id in pm._divergence_block_counts
+    assert pm._divergence_block_counts[buy.id] == pm.STUCK_DIVERGENCE_THRESHOLD_CYCLES - 1
+
+    pm.dex.get_quote = normal_quote
+    await pm._check_position(session, buy, buy.entry_price * 0.80, force_dry_run=False)
+    assert buy.id not in pm._divergence_block_counts, "лічильник мав скинутись після успішного проходження"

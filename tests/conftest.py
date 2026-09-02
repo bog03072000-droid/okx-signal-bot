@@ -19,7 +19,26 @@ import pytest
 import core.storage as storage
 import core.runtime_state as runtime_state
 import core.risk_manager as risk_manager
+import core.position_monitor as position_monitor
 from core.config import settings
+
+
+@pytest.fixture(autouse=True)
+def isolated_position_monitor_state():
+    """
+    core/position_monitor.py тримає module-level стан, keyed за buy.id:
+    _position_locks (П.1) і _divergence_block_counts (застряглі позиції).
+    fresh_db дає кожному тесту НОВУ in-memory БД з АВТОІНКРЕМЕНТОМ, що
+    починається з 1 — тобто buy.id ЛЕГКО збігається між тестами (перший
+    Trade у тесті A і перший Trade у тесті B обидва отримують id=1). Без
+    цієї fixture лічильник/лок, залишений тестом A під ключем 1, псував би
+    тест B, що створює СВІЙ buy з тим самим id.
+    """
+    position_monitor._position_locks.clear()
+    position_monitor._divergence_block_counts.clear()
+    yield
+    position_monitor._position_locks.clear()
+    position_monitor._divergence_block_counts.clear()
 
 
 @pytest.fixture(autouse=True)
